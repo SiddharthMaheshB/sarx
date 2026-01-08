@@ -20,7 +20,7 @@ def plot_all(poly_m,
              poly2_m,
              cut_line,
              to_point,
-             separation_m,
+             separation_m,  
              # full survey
             #  angle_full,
             #  path_full,
