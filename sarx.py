@@ -49,7 +49,7 @@ except Exception as e:
 # ============ Configuration ============
 CAM_SIZE = (640, 480)
 INFER_SIZE = 320
-MODEL_PATH = "yolo11n.pt"
+MODEL_PATH = "best.pt"
 DISPLAY_WINDOW = "Human Detection Delivery"
 FPS_AVG_ALPHA = 0.9
 
@@ -60,8 +60,9 @@ PERSON_AREA_THRESHOLD_BOTTOM = 0.4  # Bottom camera threshold for centered posit
 
 # MAV settings
 SYSTEM_ADDRESS = "serial:///dev/ttyACM0:115200"
-TAKEOFF_ALT = -5.0  # NED down negative = up 5m
-DELIVERY_ALT = -1.5  # NED down negative = 1.5m (25 in relative terms)
+TAKEOFF_ALT = -15.24  # NED down negative = up 15.24m (50ft)
+DELIVERY_ALT = -6  # NED down negative = up 6m (20ft)
+SEARCH_SPEED = 1.0  # m/s
 APPROACH_SPEED = 0.8  # m/s
 YAW_RATE = 30.0  # deg/s
 
@@ -565,6 +566,9 @@ def main():
                     if drone.save_checkpoint():
                         current_state = State.APPROACHING
                         print("[STATE] -> APPROACHING")
+
+                else:
+                    # No human detected, continue searching
             
             elif current_state == State.APPROACHING:
                 # Approach the human using front camera
