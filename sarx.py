@@ -670,6 +670,14 @@ def main():
                 cv2.putText(vis1, front_text, (10, 60),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
             
+            # Draw crosshair on bottom camera for centering reference
+            if current_state in [State.CENTERING, State.DESCENDING]:
+                center_x = w0 // 2
+                center_y = h0 // 2
+                cv2.line(vis0, (center_x - 30, center_y), (center_x + 30, center_y), (0, 255, 0), 2)
+                cv2.line(vis0, (center_x, center_y - 30), (center_x, center_y + 30), (0, 255, 0), 2)
+                cv2.circle(vis0, (center_x, center_y), 50, (0, 255, 0), 2)
+            
             # Combine views
             target_h = 360
             vis0_resized = cv2.resize(vis0, (int(w0 * target_h / h0), target_h))

@@ -481,10 +481,6 @@ def main():
             cv2.putText(combined, f"FPS: {fps:.1f}", (10, combined.shape[0] - 10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
-            # Add instructions
-            cv2.putText(combined, "Press 'q' to quit", (combined.shape[1] - 200, combined.shape[0] - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            
             # Display
             cv2.imshow(DISPLAY_WINDOW, combined)
             
