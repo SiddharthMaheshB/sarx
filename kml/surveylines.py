@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from shapely.geometry import Polygon, LineString
 from shapely import affinity
 
-PLAN_FILE = "rule.plan"   # <-- change if needed
+PLAN_FILE = r"generated_polygons/parking.plan"   # <-- change if needed
 
 # ---------------- 0. Unit conversion helpers ----------------
 

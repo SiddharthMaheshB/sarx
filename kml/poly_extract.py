@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from shapely.geometry import Polygon, LineString
 from shapely.ops import split
 
-PLAN_FILE = "rule.plan"   
+PLAN_FILE = "generated_polygons/parking.plan"   
 
 
 # 1) Load polygon from QGroundControl .plan file

@@ -8,7 +8,7 @@ from shapely.ops import split
 from shapely import affinity
 import custom_survey as cs
 
-PLAN_FILE = "generated_polygons/polygon_16_sides.plan"   # change if needed
+PLAN_FILE = "generated_polygons/new.plan"   # change if needed
 
 FEET_PER_METER = 3.280839895  # approx conversion
 

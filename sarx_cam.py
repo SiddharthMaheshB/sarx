@@ -59,13 +59,6 @@ DESCEND_TIME = 6.0
 DROP_TIME = 2.0
 RETURN_TIME = 5.0
 CENTERING_TIMEOUT = 15.0  # Max time in CENTERING state before timeout
-APPROACHING_TIMEOUT = 20.0  # Max time in APPROACHING state
-SEARCHING_TIMEOUT = 60.0  # Max time searching before reset
-
-# Altitude and delivery parameters
-DELIVERY_ALTITUDE_FEET = 20.0  # Descent target: 20 feet
-DELIVERY_ALTITUDE_M = DELIVERY_ALTITUDE_FEET * 0.3048  # Convert to meters
-INITIAL_ALTITUDE_M = 0.0  # Will be set when checkpoint saved
 
 
 # ============ State Machine States ============
@@ -85,18 +78,13 @@ class SimulatedDroneController:
     def __init__(self):
         self.checkpoint_saved = False
         self.checkpoint_time = None
-        self.checkpoint_altitude = 0.0  # Altitude when checkpoint saved
-        self.current_altitude = 0.0  # Current simulated altitude
         
-    def save_checkpoint(self, altitude=10.0):
-        """Simulate saving checkpoint with altitude"""
+    def save_checkpoint(self):
+        """Simulate saving checkpoint"""
         self.checkpoint_saved = True
         self.checkpoint_time = time.time()
-        self.checkpoint_altitude = altitude
-        self.current_altitude = altitude
         print("\n" + "="*60)
         print("📍 [CHECKPOINT] Position saved!")
-        print(f"   Altitude: {altitude:.2f} m ({altitude * 3.28084:.2f} ft)")
         print("="*60)
         return True
     
@@ -120,18 +108,13 @@ class SimulatedDroneController:
         if down != 0:
             dir_str = "DOWN" if down > 0 else "UP"
             directions.append(f"{dir_str} {abs(down*duration):.2f}m")
-            # Update simulated altitude
-            self.current_altitude -= down * duration  # Positive down = descending (altitude decreases)
-            if self.current_altitude < DELIVERY_ALTITUDE_M:
-                self.current_altitude = DELIVERY_ALTITUDE_M  # Never go below delivery height
         
         if yaw_rate != 0:
             dir_str = "CLOCKWISE" if yaw_rate > 0 else "COUNTER-CLOCKWISE"
-            directions.append(f"YAW {dir_str} {abs(yaw_rate*duration):.1f}°")
+            directions.append(f"YAW {dir_str} {abs(yaw_rate):.1f}°/s")
         
         if directions:
-            alt_info = f" | Alt: {self.current_altitude:.2f}m ({self.current_altitude*3.28084:.1f}ft)" if down != 0 else ""
-            print(f"🎯 [MOVE] {' + '.join(directions)}{alt_info}")
+            print(f"🎯 [MOVE] {' + '.join(directions)}")
     
     def yaw_towards(self, yaw_rate_deg=YAW_RATE, duration=0.5):
         """Print yaw instruction"""
@@ -141,17 +124,16 @@ class SimulatedDroneController:
     def descend_to_delivery_height(self):
         """Print descent instruction"""
         print("\n" + "="*60)
-        print(f"⬇️  [DESCEND] Lowering to delivery height ({DELIVERY_ALTITUDE_FEET:.0f} ft / {DELIVERY_ALTITUDE_M:.2f}m)")
+        print("⬇️  [DESCEND] Lower camera to delivery height (1.5m from ground)")
         print("="*60)
-        self.current_altitude = DELIVERY_ALTITUDE_M
     
     def return_to_checkpoint(self):
         """Print return instruction"""
         print("\n" + "="*60)
-        print("🔙 [RETURN] Moving back to checkpoint")
-        print(f"   Target altitude: {self.checkpoint_altitude:.2f} m ({self.checkpoint_altitude * 3.28084:.2f} ft)")
+        print("🔙 [RETURN] Move camera back to original checkpoint position")
+        print("    - First: Raise to original height")
+        print("    - Then: Move backward to starting point")
         print("="*60)
-        self.current_altitude = self.checkpoint_altitude
 
 
 # ============ Model Loading ============
@@ -503,105 +485,96 @@ def main():
             # ========== State Machine Logic ==========
             old_state = current_state
             
-            # State timeout check (applies to most states)
-            elapsed = time.time() - state_start_time
-            
             if current_state == State.SEARCHING:
                 # Looking for human in front camera
-                # Timeout protection: reset after 60 seconds
-                if elapsed > SEARCHING_TIMEOUT:
-                    print(f"\n⏱️  [TIMEOUT] Searching timeout after {elapsed:.1f}s!")
-                    print("   Resetting search mode...")
-                    current_state = State.SEARCHING
-                    state_start_time = time.time()
-                
-                elif found_front and area_front > PERSON_AREA_THRESHOLD_FRONT:
+                if found_front and area_front > PERSON_AREA_THRESHOLD_FRONT:
                     print(f"\n🎯 [DETECTION] Human detected in FRONT camera!")
-                    print(f"   Area ratio: {area_front:.3f} (threshold: {PERSON_AREA_THRESHOLD_FRONT})")
-                    print(f"   Position offset: ({cx_front:.2f}, {cy_front:.2f})")
-                    if drone.save_checkpoint(altitude=10.0):  # Save at 10m altitude
+                    print(f"   Area: {area_front:.3f} (threshold: {PERSON_AREA_THRESHOLD_FRONT})")
+                    print(f"   Position: ({cx_front:.2f}, {cy_front:.2f})")
+                    if drone.save_checkpoint():
                         current_state = State.APPROACHING
                         state_start_time = time.time()
-                elif elapsed % 5 < 0.1:  # Log every 5 seconds
-                    print(f"🔍 [SEARCHING] Scanning for target... ({elapsed:.0f}s elapsed)")
             
             elif current_state == State.APPROACHING:
                 # Approach the human using front camera
-                # Timeout protection: return to search after 20 seconds
-                if elapsed > APPROACHING_TIMEOUT:
-                    print(f"\n⏱️  [TIMEOUT] Approaching timeout after {elapsed:.1f}s!")
+                if found_front:
+                    # Yaw towards human (based on horizontal offset)
+                    yaw_rate = cx_front * YAW_RATE  # Proportional control
+                    
+                    # Move forward while adjusting yaw
+                    drone.move_with_yaw(
+                        forward=APPROACH_SPEED,
+                        right=0.0,
+                        down=0.0,
+                        yaw_rate=yaw_rate,
+                        duration=0.3
+                    )
+                    
+                    # Check if human visible in bottom camera
+                    if found_bottom and area_bottom > 0.05:
+                        print(f"\n👁️  [DETECTION] Human now visible in BOTTOM camera!")
+                        print(f"   Area: {area_bottom:.3f}")
+                        current_state = State.CENTERING
+                        state_start_time = time.time()
+                else:
+                    # Lost target, return to searching
+                    print("\n⚠️  [WARNING] Lost target in front camera!")
                     print("   Returning to search mode...")
                     current_state = State.SEARCHING
                     state_start_time = time.time()
-                
-                # CHECK FOR BOTTOM CAMERA FIRST - transition to CENTERING if detected
-                if found_bottom:
-                    print(f"\n👁️  [TRANSITION] Human detected in BOTTOM camera!")
-                    print(f"   Bottom area: {area_bottom:.3f}")
-                    if found_front:
-                        print(f"   Front area: {area_front:.3f}")
-                    print(f"   Switching to CENTERING mode")
-                    current_state = State.CENTERING
-                    state_start_time = time.time()
-                
-                # Otherwise, continue approaching using front camera if available
-                elif found_front:
-                    # Yaw towards human first to face them
-                    if abs(cx_front) > 0.1:  # If not centered horizontally
-                        yaw_rate = cx_front * YAW_RATE  # Proportional yaw control
-                        drone.yaw_towards(yaw_rate_deg=yaw_rate, duration=0.3)
-                        if elapsed % 2 < 0.1:  # Log every 2 seconds
-                            print(f"🔄 [APPROACHING] Yawing to face person (offset: {cx_front:.2f})")
-                    else:
-                        # Facing person, now move forward
-                        drone.move_forward(speed=APPROACH_SPEED, duration=0.3)
-                        if elapsed % 2 < 0.1:
-                            print(f"➡️  [APPROACHING] Moving forward toward person (area: {area_front:.3f})")
-                else:
-                    # Lost target in front camera
-                    if elapsed % 1 < 0.1:  # Log every second
-                        print(f"⚠️  [WARNING] Lost target in front camera! ({elapsed:.1f}s elapsed)")
-                    # Stay in approaching a bit longer before giving up
-                    if elapsed > APPROACHING_TIMEOUT / 2:
-                        print("\n❌ [ABORT] Lost target for too long, returning to SEARCHING")
-                        current_state = State.SEARCHING
-                        state_start_time = time.time()
             
             elif current_state == State.CENTERING:
                 # Use bottom camera to center over person
-                # Timeout protection: return to approach after 15 seconds
+                elapsed = time.time() - state_start_time
+                
                 if elapsed > CENTERING_TIMEOUT:
+                    # Timeout - centering took too long
                     print(f"\n⏱️  [TIMEOUT] Centering timeout after {elapsed:.1f}s!")
                     print("   Returning to APPROACHING state...")
                     current_state = State.APPROACHING
                     state_start_time = time.time()
                 
                 elif found_bottom:
-                    # Check if centered (within thresholds)
-                    if abs(cx_bottom) < 0.10 and abs(cy_bottom) < 0.10:
+                    # Proportional control to center over person
+                    forward_vel = -cy_bottom * 0.5  # Negative because +y is down in image
+                    right_vel = cx_bottom * 0.5
+                    
+                    # Check if centered (within threshold)
+                    if abs(cx_bottom) < 0.15 and abs(cy_bottom) < 0.15:
                         # Person is centered horizontally and vertically
-                        if area_bottom >= PERSON_AREA_THRESHOLD_BOTTOM:
+                        if area_bottom > PERSON_AREA_THRESHOLD_BOTTOM:
                             # Ready to descend and deliver
-                            print(f"\n✅ [CENTERED] Person centered in bottom camera!")
+                            print(f"\n✅ [CENTERED] Person is centered in bottom camera!")
                             print(f"   Area: {area_bottom:.3f} (threshold: {PERSON_AREA_THRESHOLD_BOTTOM})")
                             print(f"   Position offset: ({cx_bottom:.2f}, {cy_bottom:.2f})")
                             print(f"   Time to center: {elapsed:.1f}s")
-                            print(f"   Switching to DESCENDING mode")
                             current_state = State.DESCENDING
                             state_start_time = time.time()
                         else:
                             # Centered but too far away - descend slowly to get closer
                             if elapsed % 1 < 0.1:  # Log every second
-                                print(f"📐 [CENTERING] Centered, descending to target size...")
+                                print(f"📐 [CENTERING] Centered position reached, descending to target size...")
                                 print(f"   Current area: {area_bottom:.3f} → Target: {PERSON_AREA_THRESHOLD_BOTTOM:.3f}")
-                            drone.move_with_yaw(forward=0.0, right=0.0, down=0.5, yaw_rate=0.0, duration=0.3)
+                            drone.move_with_yaw(
+                                forward=0.0,
+                                right=0.0,
+                                down=0.3,  # Descend faster when centered
+                                yaw_rate=0.0,
+                                duration=0.3
+                            )
                     else:
-                        # Not centered - adjust position using proportional control
-                        forward_vel = -cy_bottom * 0.5  # Negative because +y is down
-                        right_vel = cx_bottom * 0.5
+                        # Not centered - adjust position
+                        # Log movement commands
+                        directions = []
+                        if abs(right_vel) > 0.05:
+                            directions.append(f"RIGHT {right_vel:.2f}" if right_vel > 0 else f"LEFT {abs(right_vel):.2f}")
+                        if abs(forward_vel) > 0.05:
+                            directions.append(f"{'FORWARD' if forward_vel > 0 else 'BACKWARD'} {abs(forward_vel):.2f}")
                         
-                        if elapsed % 2 < 0.1:  # Log movement every 2 seconds
-                            print(f"🎯 [CENTERING] Adjusting position (x_off: {cx_bottom:.2f}, y_off: {cy_bottom:.2f}, area: {area_bottom:.3f})")
+                        if directions or elapsed % 2 < 0.1:  # Log periodically
+                            print(f"🎯 [CENTERING] Adjusting position (offset: x={cx_bottom:.2f}, y={cy_bottom:.2f})")
+                            if directions:
+                                print(f"   Moving: {', '.join(directions)}")
                         
                         drone.move_with_yaw(
                             forward=forward_vel,
@@ -613,77 +586,61 @@ def main():
                 else:
                     # Lost bottom view - try to recover by moving upward
                     if elapsed % 1 < 0.1:  # Log every second
-                        print(f"⚠️  [WARNING] Lost target in bottom camera! ({elapsed:.1f}s)")
+                        print(f"⚠️  [WARNING] Lost target in bottom camera!")
+                        print(f"   Attempting recovery by ascending...")
                     
                     # Move upward to regain view
-                    drone.move_with_yaw(forward=0.0, right=0.0, down=-0.3, yaw_rate=0.0, duration=0.3)
+                    drone.move_with_yaw(
+                        forward=0.0,
+                        right=0.0,
+                        down=-0.3,  # Move up (negative down = up)
+                        yaw_rate=0.0,
+                        duration=0.3
+                    )
                     
                     # If lost for too long, abort centering
                     if elapsed > CENTERING_TIMEOUT / 2:
-                        print(f"\n❌ [ABORT] Lost target for {elapsed:.1f}s, returning to APPROACHING")
+                        print(f"\n❌ [ABORT] Lost target in bottom camera for {elapsed:.1f}s")
+                        print("   Returning to APPROACHING state...")
                         current_state = State.APPROACHING
                         state_start_time = time.time()
             
             elif current_state == State.DESCENDING:
-                # Descend to delivery altitude (20 feet / 6.1 meters)
-                descent_distance = drone.checkpoint_altitude - DELIVERY_ALTITUDE_M
-                descent_rate = 1.0  # m/s descent speed
-                descend_time = descent_distance / descent_rate
-                
-                if elapsed < descend_time:
-                    remaining_alt = drone.checkpoint_altitude - (descent_rate * elapsed)
-                    remaining_time = descend_time - elapsed
-                    if elapsed % 1 < 0.1:  # Log every second
-                        print(f"⬇️  [DESCENDING] Lowering to delivery height")
-                        print(f"   Current: {drone.current_altitude:.2f}m ({drone.current_altitude*3.28084:.1f}ft) → Target: {DELIVERY_ALTITUDE_M:.2f}m ({DELIVERY_ALTITUDE_FEET:.0f}ft)")
-                        print(f"   Time remaining: {remaining_time:.1f}s")
-                    
-                    # Descend at 1 m/s
-                    drone.move_with_yaw(forward=0.0, right=0.0, down=descent_rate, yaw_rate=0.0, duration=0.3)
+                # Simulate descent time
+                elapsed = time.time() - state_start_time
+                if elapsed < DESCEND_TIME:
+                    remaining = DESCEND_TIME - elapsed
+                    print(f"⬇️  [DESCENDING] Lowering to delivery height... ({remaining:.1f}s remaining)")
+                    time.sleep(1)  # Print every second
                 else:
-                    # Reached delivery altitude
                     drone.descend_to_delivery_height()
-                    print(f"✅ [READY] Delivery altitude reached ({DELIVERY_ALTITUDE_FEET:.0f} ft)")
                     current_state = State.DROPPING
                     state_start_time = time.time()
             
             elif current_state == State.DROPPING:
-                # Release payload
+                # Simulate drop time
+                elapsed = time.time() - state_start_time
                 if elapsed < DROP_TIME:
-                    if elapsed % 0.5 < 0.1:  # Log every 0.5 seconds
-                        remaining = DROP_TIME - elapsed
-                        print(f"📦 [DROPPING] Releasing payload... ({remaining:.1f}s remaining)")
+                    print("📦 [DROPPING] Releasing payload...")
+                    time.sleep(1)
                 else:
                     print("\n" + "="*60)
-                    print("✅ [SUCCESS] Payload dropped successfully!")
-                    print(f"   Drop altitude: {DELIVERY_ALTITUDE_FEET:.0f} ft ({DELIVERY_ALTITUDE_M:.2f}m)")
+                    print("✅ [PAYLOAD] Payload dropped successfully!")
                     print("="*60)
                     current_state = State.RETURNING
                     state_start_time = time.time()
             
             elif current_state == State.RETURNING:
-                # Return to checkpoint altitude
-                altitude_diff = abs(drone.checkpoint_altitude - drone.current_altitude)
-                return_rate = 1.0  # m/s return speed
-                return_time = altitude_diff / return_rate
-                
-                if elapsed < return_time:
-                    remaining_time = return_time - elapsed
-                    if elapsed % 1 < 0.1:  # Log every second
-                        print(f"🔙 [RETURNING] Moving back to checkpoint")
-                        print(f"   Current: {drone.current_altitude:.2f}m ({drone.current_altitude*3.28084:.1f}ft) → Checkpoint: {drone.checkpoint_altitude:.2f}m ({drone.checkpoint_altitude*3.28084:.1f}ft)")
-                        print(f"   Time remaining: {remaining_time:.1f}s")
-                    
-                    # Return to checkpoint altitude
-                    if drone.current_altitude < drone.checkpoint_altitude:
-                        drone.move_with_yaw(forward=0.0, right=0.0, down=-return_rate, yaw_rate=0.0, duration=0.3)  # Up
-                    else:
-                        drone.move_with_yaw(forward=0.0, right=0.0, down=return_rate, yaw_rate=0.0, duration=0.3)  # Down
+                # Simulate return time
+                elapsed = time.time() - state_start_time
+                if elapsed < RETURN_TIME:
+                    remaining = RETURN_TIME - elapsed
+                    print(f"🔙 [RETURNING] Moving back to checkpoint... ({remaining:.1f}s remaining)")
+                    time.sleep(1)
                 else:
                     drone.return_to_checkpoint()
                     print("\n" + "="*60)
                     print("✅ [COMPLETE] Delivery mission complete!")
-                    print(f"   Final altitude: {drone.checkpoint_altitude:.2f}m ({drone.checkpoint_altitude*3.28084:.1f}ft)")
                     print("   Resuming search for next target...")
                     print("="*60)
                     current_state = State.SEARCHING

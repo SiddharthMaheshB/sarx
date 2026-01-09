@@ -45,7 +45,8 @@ def latlon_to_local_xy_m(lat, lon, lat0, lon0):
 
 def load_polygon_from_plan_in_meters(path):
     """
-    Load geoFence polygon from QGroundControl .plan file and convert to local meters.
+    Load geoFence polygon from QGroundControl .plan file (v2) and convert to local meters.
+    Supports polygon versions 1 and 2.
     """
     with open(path, "rt", encoding="utf-8") as f:
         data = json.load(f)
@@ -54,7 +55,9 @@ def load_polygon_from_plan_in_meters(path):
     if not polys:
         raise ValueError("No polygons found in geoFence")
 
-    raw = polys[0]["polygon"]  # list of [lat, lon]
+    # Get first polygon; supports both v1 and v2 formats
+    poly_obj = polys[0]
+    raw = poly_obj["polygon"]  # list of [lat, lon]
 
     lats = [p[0] for p in raw]
     lons = [p[1] for p in raw]
