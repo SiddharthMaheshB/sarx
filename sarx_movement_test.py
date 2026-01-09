@@ -183,6 +183,7 @@ class DroneController:
                 self.current_position = position
                 self.current_altitude = -position.relative_altitude_m  # NED (negative down)
                 self.altitude_m = abs(position.relative_altitude_m)  # Positive altitude (positive = up)
+                print("[POSITION] Lat: ",position.latitude_deg ," Long: ", position.longitude_deg ," Alt: ",position.absolute_altitude_m)
                 await asyncio.sleep(0.1)
         except Exception as e:
             print(f"[DRONE] Position monitor error: {e}")
