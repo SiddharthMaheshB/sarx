@@ -303,39 +303,82 @@ class DroneController:
             print(f"[DRONE] Return to checkpoint error: {e}")
     
     async def _do_return_to_checkpoint(self):
-        """Navigate back to checkpoint"""
+        """Navigate back to checkpoint using GPS-based navigation"""
         if not self.checkpoint_position or not self.checkpoint_altitude:
             print("[DRONE] No checkpoint saved, cannot return")
             return
         
         try:
-            print("[DRONE] Returning to checkpoint...")
+            print("[DRONE] Returning to checkpoint using GPS navigation...")
+            print(f"   Target: {self.checkpoint_position['lat']:.6f}, {self.checkpoint_position['lon']:.6f}")
+            print(f"   Target altitude: {self.checkpoint_altitude_m:.2f}m")
             
-            # First, ascend to original altitude
-            print(f"[DRONE] Ascending to original altitude {self.checkpoint_altitude}m...")
+            # Stop offboard mode to use action.goto_location
+            print("[DRONE] Stopping offboard mode for GPS navigation...")
+            await self.drone.offboard.stop()
+            await asyncio.sleep(0.5)
+            
+            # Use GPS-based goto_location for precise navigation
+            # goto_location uses absolute altitude (MSL)
+            await self.drone.action.goto_location(
+                latitude_deg=self.checkpoint_position['lat'],
+                longitude_deg=self.checkpoint_position['lon'],
+                absolute_altitude_m=self.checkpoint_position['alt'],
+                yaw_deg=0.0  # Maintain current heading
+            )
+            
+            print("[DRONE] GPS navigation command sent, monitoring progress...")
+            
+            # Monitor distance to checkpoint
+            start_time = time.time()
+            arrived = False
+            
+            while True:
+                if self.current_position:
+                    # Calculate distance to checkpoint
+                    distance = self._calculate_gps_distance(
+                        self.current_position.latitude_deg,
+                        self.current_position.longitude_deg,
+                        self.checkpoint_position['lat'],
+                        self.checkpoint_position['lon']
+                    )
+                    
+                    altitude_diff = abs(self.current_position.absolute_altitude_m - 
+                                       self.checkpoint_position['alt'])
+                    
+                    # Check if arrived (within 2 meters horizontally and 1 meter vertically)
+                    if distance < 2.0 and altitude_diff < 1.0:
+                        arrived = True
+                        print(f"[DRONE] ✅ Arrived at checkpoint!")
+                        print(f"   Distance: {distance:.2f}m, Alt diff: {altitude_diff:.2f}m")
+                        break
+                    
+                    # Log progress every 2 seconds
+                    if int(time.time() - start_time) % 2 == 0:
+                        print(f"[DRONE] Returning... Distance: {distance:.1f}m, Alt diff: {altitude_diff:.1f}m")
+                
+                await asyncio.sleep(0.5)
+            
+            # Resume offboard mode for continued operation
+            print("[DRONE] Resuming offboard mode...")
             await self.drone.offboard.set_position_ned(
                 PositionNedYaw(0.0, 0.0, self.checkpoint_altitude, 0.0)
             )
-            await asyncio.sleep(5)
+            await self.drone.offboard.start()
+            await asyncio.sleep(1)
             
-            # Use simple backward movement (approximation)
-            # In production, use GPS-based navigation
-            ### IMPLEMENT GPS BASED NAVIGATION
-            print("[DRONE] Moving back to checkpoint (approximate)...")
-            await self.drone.offboard.set_velocity_body(
-                VelocityBodyYawspeed(-APPROACH_SPEED, 0.0, 0.0, 0.0)
-            )
-            await asyncio.sleep(5)  # Adjust based on distance traveled
-            
-            # Stop
-            await self.drone.offboard.set_velocity_body(
-                VelocityBodyYawspeed(0.0, 0.0, 0.0, 0.0)
-            )
-            
-            print("[DRONE] Returned to checkpoint area")
+            print("[DRONE] Returned to checkpoint, offboard mode active")
             
         except Exception as e:
             print(f"[DRONE] Return navigation error: {e}")
+            # Try to restart offboard mode on error
+            try:
+                await self.drone.offboard.set_position_ned(
+                    PositionNedYaw(0.0, 0.0, self.checkpoint_altitude, 0.0)
+                )
+                await self.drone.offboard.start()
+            except Exception as e2:
+                print(f"[DRONE] Failed to restart offboard: {e2}")
     
     def stop_and_land(self):
         """Stop offboard mode and land"""
@@ -360,6 +403,25 @@ class DroneController:
     def is_ready(self):
         """Check if drone is connected and ready"""
         return self._connected
+    
+    def _calculate_gps_distance(self, lat1, lon1, lat2, lon2):
+        """
+        Calculate distance between two GPS coordinates using Haversine formula
+        Returns distance in meters
+        """
+        R = 6371000  # Earth's radius in meters
+        
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        delta_phi = math.radians(lat2 - lat1)
+        delta_lambda = math.radians(lon2 - lon1)
+        
+        a = math.sin(delta_phi/2)**2 + \
+            math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda/2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        
+        distance = R * c
+        return distance
     
     async def _stop_and_land_coro(self):
         """Stop offboard and land"""
