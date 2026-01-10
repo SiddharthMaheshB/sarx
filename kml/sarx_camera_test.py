@@ -62,6 +62,11 @@ CENTERING_TIMEOUT = 15.0  # Max time in CENTERING state before timeout
 APPROACHING_TIMEOUT = 20.0  # Max time in APPROACHING state
 SEARCHING_TIMEOUT = 60.0  # Max time searching before reset
 
+# Consecutive frame detection tracking (for state stability)
+CONSECUTIVE_FRAMES_REQUIRED = 3  # Require 3 consecutive frames for state transition
+consecutive_front_detections = 0  # Counter for front camera detections
+consecutive_bottom_detections = 0  # Counter for bottom camera detections
+
 # Altitude and delivery parameters
 DELIVERY_ALTITUDE_FEET = 20.0  # Descent target: 20 feet
 DELIVERY_ALTITUDE_M = DELIVERY_ALTITUDE_FEET * 0.3048  # Convert to meters
@@ -449,6 +454,10 @@ def main():
     # State timing for simulated operations
     state_start_time = time.time()
     
+    # Consecutive detection frame counters (local scope)
+    consecutive_front_detections = 0
+    consecutive_bottom_detections = 0
+    
     print("="*60)
     print("🚀 STARTING DETECTION LOOP")
     print("="*60)
@@ -507,65 +516,93 @@ def main():
             elapsed = time.time() - state_start_time
             
             if current_state == State.SEARCHING:
-                # Looking for human in front camera
+                # Looking for human in front camera with consecutive frame stability
                 # Timeout protection: reset after 60 seconds
                 if elapsed > SEARCHING_TIMEOUT:
                     print(f"\n⏱️  [TIMEOUT] Searching timeout after {elapsed:.1f}s!")
                     print("   Resetting search mode...")
                     current_state = State.SEARCHING
                     state_start_time = time.time()
+                    consecutive_front_detections = 0  # Reset counter on timeout
                 
                 elif found_front and area_front > PERSON_AREA_THRESHOLD_FRONT:
-                    print(f"\n🎯 [DETECTION] Human detected in FRONT camera!")
-                    print(f"   Area ratio: {area_front:.3f} (threshold: {PERSON_AREA_THRESHOLD_FRONT})")
-                    print(f"   Position offset: ({cx_front:.2f}, {cy_front:.2f})")
-                    if drone.save_checkpoint(altitude=10.0):  # Save at 10m altitude
-                        current_state = State.APPROACHING
-                        state_start_time = time.time()
-                elif elapsed % 5 < 0.1:  # Log every 5 seconds
-                    print(f"🔍 [SEARCHING] Scanning for target... ({elapsed:.0f}s elapsed)")
+                    # Increment consecutive detection counter
+                    consecutive_front_detections += 1
+                    
+                    if consecutive_front_detections >= CONSECUTIVE_FRAMES_REQUIRED:
+                        print(f"\n🎯 [DETECTION] Human detected consistently ({consecutive_front_detections} frames) in FRONT camera!")
+                        print(f"   Area ratio: {area_front:.3f} (threshold: {PERSON_AREA_THRESHOLD_FRONT})")
+                        print(f"   Position offset: ({cx_front:.2f}, {cy_front:.2f})")
+                        if drone.save_checkpoint(altitude=10.0):  # Save at 10m altitude
+                            current_state = State.APPROACHING
+                            state_start_time = time.time()
+                            consecutive_front_detections = 0  # Reset counter on state change
+                            consecutive_bottom_detections = 0  # Reset bottom counter for new state
+                    elif elapsed % 1 < 0.1:  # Log progress every second
+                        print(f"🔍 [SEARCHING] Detection streak: {consecutive_front_detections}/{CONSECUTIVE_FRAMES_REQUIRED} frames")
+                else:
+                    # Lost detection - reset counter
+                    if consecutive_front_detections > 0:
+                        consecutive_front_detections = 0
+                    elif elapsed % 5 < 0.1:  # Log every 5 seconds if no detection
+                        print(f"🔍 [SEARCHING] Scanning for target... ({elapsed:.0f}s elapsed)")
             
             elif current_state == State.APPROACHING:
-                # Approach the human using front camera
+                # Approach the human using front camera with consistent bottom camera detection
                 # Timeout protection: return to search after 20 seconds
                 if elapsed > APPROACHING_TIMEOUT:
                     print(f"\n⏱️  [TIMEOUT] Approaching timeout after {elapsed:.1f}s!")
                     print("   Returning to search mode...")
                     current_state = State.SEARCHING
                     state_start_time = time.time()
+                    consecutive_front_detections = 0  # Reset counters on timeout
+                    consecutive_bottom_detections = 0
                 
-                # CHECK FOR BOTTOM CAMERA FIRST - transition to CENTERING if detected
+                # CHECK FOR BOTTOM CAMERA FIRST - transition to CENTERING if detected consistently
                 if found_bottom:
-                    print(f"\n👁️  [TRANSITION] Human detected in BOTTOM camera!")
-                    print(f"   Bottom area: {area_bottom:.3f}")
-                    if found_front:
-                        print(f"   Front area: {area_front:.3f}")
-                    print(f"   Switching to CENTERING mode")
-                    current_state = State.CENTERING
-                    state_start_time = time.time()
-                
-                # Otherwise, continue approaching using front camera if available
-                elif found_front:
-                    # Yaw towards human first to face them
-                    if abs(cx_front) > 0.1:  # If not centered horizontally
-                        yaw_rate = cx_front * YAW_RATE  # Proportional yaw control
-                        drone.yaw_towards(yaw_rate_deg=yaw_rate, duration=0.3)
-                        if elapsed % 2 < 0.1:  # Log every 2 seconds
-                            print(f"🔄 [APPROACHING] Yawing to face person (offset: {cx_front:.2f})")
-                    else:
-                        # Facing person, now move forward
-                        drone.move_forward(speed=APPROACH_SPEED, duration=0.3)
-                        if elapsed % 2 < 0.1:
-                            print(f"➡️  [APPROACHING] Moving forward toward person (area: {area_front:.3f})")
-                else:
-                    # Lost target in front camera
-                    if elapsed % 1 < 0.1:  # Log every second
-                        print(f"⚠️  [WARNING] Lost target in front camera! ({elapsed:.1f}s elapsed)")
-                    # Stay in approaching a bit longer before giving up
-                    if elapsed > APPROACHING_TIMEOUT / 2:
-                        print("\n❌ [ABORT] Lost target for too long, returning to SEARCHING")
-                        current_state = State.SEARCHING
+                    # Increment consecutive detection counter
+                    consecutive_bottom_detections += 1
+                    
+                    if consecutive_bottom_detections >= CONSECUTIVE_FRAMES_REQUIRED:
+                        print(f"\n👁️  [TRANSITION] Human detected consistently ({consecutive_bottom_detections} frames) in BOTTOM camera!")
+                        print(f"   Bottom area: {area_bottom:.3f}")
+                        if found_front:
+                            print(f"   Front area: {area_front:.3f}")
+                        print(f"   Switching to CENTERING mode")
+                        current_state = State.CENTERING
                         state_start_time = time.time()
+                        consecutive_bottom_detections = 0  # Reset counter on state change
+                    elif elapsed % 1 < 0.1:  # Log progress every second
+                        print(f"📡 [APPROACHING] Bottom detection streak: {consecutive_bottom_detections}/{CONSECUTIVE_FRAMES_REQUIRED} frames")
+                else:
+                    # Lost detection - reset counter
+                    if consecutive_bottom_detections > 0:
+                        consecutive_bottom_detections = 0
+                    
+                    # Continue approaching using front camera if available
+                    if found_front:
+                        # Yaw towards human first to face them
+                        if abs(cx_front) > 0.1:  # If not centered horizontally
+                            yaw_rate = cx_front * YAW_RATE  # Proportional yaw control
+                            drone.yaw_towards(yaw_rate_deg=yaw_rate, duration=0.3)
+                            if elapsed % 2 < 0.1:  # Log every 2 seconds
+                                print(f"🔄 [APPROACHING] Yawing to face person (offset: {cx_front:.2f})")
+                        else:
+                            # Facing person, now move forward
+                            drone.move_forward(speed=APPROACH_SPEED, duration=0.3)
+                            if elapsed % 2 < 0.1:
+                                print(f"➡️  [APPROACHING] Moving forward toward person (area: {area_front:.3f})")
+                    else:
+                        # Lost target in front camera
+                        if elapsed % 1 < 0.1:  # Log every second
+                            print(f"⚠️  [WARNING] Lost target in front camera! ({elapsed:.1f}s elapsed)")
+                        # Stay in approaching a bit longer before giving up
+                        if elapsed > APPROACHING_TIMEOUT / 2:
+                            print("\n❌ [ABORT] Lost target for too long, returning to SEARCHING")
+                            current_state = State.SEARCHING
+                            state_start_time = time.time()
+                            consecutive_front_detections = 0  # Reset counters on abort
+                            consecutive_bottom_detections = 0
             
             elif current_state == State.CENTERING:
                 # Use bottom camera to center over person
@@ -575,6 +612,7 @@ def main():
                     print("   Returning to APPROACHING state...")
                     current_state = State.APPROACHING
                     state_start_time = time.time()
+                    consecutive_bottom_detections = 0  # Reset counter on timeout
                 
                 elif found_bottom:
                     # Check if centered (within thresholds)
@@ -611,7 +649,10 @@ def main():
                             duration=0.3
                         )
                 else:
-                    # Lost bottom view - try to recover by moving upward
+                    # Lost bottom view - reset consecutive counter and try to recover
+                    if consecutive_bottom_detections > 0:
+                        consecutive_bottom_detections = 0
+                    
                     if elapsed % 1 < 0.1:  # Log every second
                         print(f"⚠️  [WARNING] Lost target in bottom camera! ({elapsed:.1f}s)")
                     
@@ -623,6 +664,7 @@ def main():
                         print(f"\n❌ [ABORT] Lost target for {elapsed:.1f}s, returning to APPROACHING")
                         current_state = State.APPROACHING
                         state_start_time = time.time()
+                        consecutive_bottom_detections = 0  # Reset counter on abort
             
             elif current_state == State.DESCENDING:
                 # Descend to delivery altitude (20 feet / 6.1 meters)
