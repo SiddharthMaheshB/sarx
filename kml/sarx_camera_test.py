@@ -458,6 +458,15 @@ def main():
     consecutive_front_detections = 0
     consecutive_bottom_detections = 0
     
+    # Track previous detection positions for same-person matching
+    prev_front_cx = None
+    prev_front_cy = None
+    prev_bottom_cx = None
+    prev_bottom_cy = None
+    
+    # Distance threshold for considering it the same person (normalized image coordinates)
+    SAME_PERSON_THRESHOLD = 0.15  # 15% of image dimension
+    
     print("="*60)
     print("🚀 STARTING DETECTION LOOP")
     print("="*60)
@@ -524,13 +533,32 @@ def main():
                     current_state = State.SEARCHING
                     state_start_time = time.time()
                     consecutive_front_detections = 0  # Reset counter on timeout
+                    prev_front_cx = None
+                    prev_front_cy = None
                 
                 elif found_front and area_front > PERSON_AREA_THRESHOLD_FRONT:
-                    # Increment consecutive detection counter
-                    consecutive_front_detections += 1
+                    # Check if this is the same person as previous frame
+                    is_same_person = False
+                    
+                    if prev_front_cx is not None and prev_front_cy is not None:
+                        # Calculate distance between current and previous detection
+                        distance = ((cx_front - prev_front_cx)**2 + (cy_front - prev_front_cy)**2)**0.5
+                        if distance < SAME_PERSON_THRESHOLD:
+                            is_same_person = True
+                            consecutive_front_detections += 1
+                        else:
+                            # Different person detected - reset counter
+                            consecutive_front_detections = 1
+                    else:
+                        # First detection in this state - start counting
+                        consecutive_front_detections = 1
+                    
+                    # Update previous position
+                    prev_front_cx = cx_front
+                    prev_front_cy = cy_front
                     
                     if consecutive_front_detections >= CONSECUTIVE_FRAMES_REQUIRED:
-                        print(f"\n🎯 [DETECTION] Human detected consistently ({consecutive_front_detections} frames) in FRONT camera!")
+                        print(f"\n🎯 [DETECTION] SAME person detected consistently ({consecutive_front_detections} frames) in FRONT camera!")
                         print(f"   Area ratio: {area_front:.3f} (threshold: {PERSON_AREA_THRESHOLD_FRONT})")
                         print(f"   Position offset: ({cx_front:.2f}, {cy_front:.2f})")
                         if drone.save_checkpoint(altitude=10.0):  # Save at 10m altitude
@@ -538,12 +566,16 @@ def main():
                             state_start_time = time.time()
                             consecutive_front_detections = 0  # Reset counter on state change
                             consecutive_bottom_detections = 0  # Reset bottom counter for new state
+                            prev_front_cx = None
+                            prev_front_cy = None
                     elif elapsed % 1 < 0.1:  # Log progress every second
-                        print(f"🔍 [SEARCHING] Detection streak: {consecutive_front_detections}/{CONSECUTIVE_FRAMES_REQUIRED} frames")
+                        print(f"🔍 [SEARCHING] Same-person streak: {consecutive_front_detections}/{CONSECUTIVE_FRAMES_REQUIRED} frames")
                 else:
-                    # Lost detection - reset counter
+                    # Lost detection - reset counter and position
                     if consecutive_front_detections > 0:
                         consecutive_front_detections = 0
+                        prev_front_cx = None
+                        prev_front_cy = None
                     elif elapsed % 5 < 0.1:  # Log every 5 seconds if no detection
                         print(f"🔍 [SEARCHING] Scanning for target... ({elapsed:.0f}s elapsed)")
             
@@ -557,14 +589,35 @@ def main():
                     state_start_time = time.time()
                     consecutive_front_detections = 0  # Reset counters on timeout
                     consecutive_bottom_detections = 0
+                    prev_front_cx = None
+                    prev_front_cy = None
+                    prev_bottom_cx = None
+                    prev_bottom_cy = None
                 
                 # CHECK FOR BOTTOM CAMERA FIRST - transition to CENTERING if detected consistently
                 if found_bottom:
-                    # Increment consecutive detection counter
-                    consecutive_bottom_detections += 1
+                    # Check if this is the same person as previous frame
+                    is_same_person_bottom = False
+                    
+                    if prev_bottom_cx is not None and prev_bottom_cy is not None:
+                        # Calculate distance between current and previous detection
+                        distance = ((cx_bottom - prev_bottom_cx)**2 + (cy_bottom - prev_bottom_cy)**2)**0.5
+                        if distance < SAME_PERSON_THRESHOLD:
+                            is_same_person_bottom = True
+                            consecutive_bottom_detections += 1
+                        else:
+                            # Different person detected in bottom - reset counter
+                            consecutive_bottom_detections = 1
+                    else:
+                        # First detection in this state - start counting
+                        consecutive_bottom_detections = 1
+                    
+                    # Update previous position
+                    prev_bottom_cx = cx_bottom
+                    prev_bottom_cy = cy_bottom
                     
                     if consecutive_bottom_detections >= CONSECUTIVE_FRAMES_REQUIRED:
-                        print(f"\n👁️  [TRANSITION] Human detected consistently ({consecutive_bottom_detections} frames) in BOTTOM camera!")
+                        print(f"\n👁️  [TRANSITION] SAME person detected consistently ({consecutive_bottom_detections} frames) in BOTTOM camera!")
                         print(f"   Bottom area: {area_bottom:.3f}")
                         if found_front:
                             print(f"   Front area: {area_front:.3f}")
@@ -572,12 +625,16 @@ def main():
                         current_state = State.CENTERING
                         state_start_time = time.time()
                         consecutive_bottom_detections = 0  # Reset counter on state change
+                        prev_bottom_cx = None
+                        prev_bottom_cy = None
                     elif elapsed % 1 < 0.1:  # Log progress every second
-                        print(f"📡 [APPROACHING] Bottom detection streak: {consecutive_bottom_detections}/{CONSECUTIVE_FRAMES_REQUIRED} frames")
+                        print(f"📡 [APPROACHING] Same-person streak (bottom): {consecutive_bottom_detections}/{CONSECUTIVE_FRAMES_REQUIRED} frames")
                 else:
-                    # Lost detection - reset counter
+                    # Lost detection - reset counter and position
                     if consecutive_bottom_detections > 0:
                         consecutive_bottom_detections = 0
+                        prev_bottom_cx = None
+                        prev_bottom_cy = None
                     
                     # Continue approaching using front camera if available
                     if found_front:
@@ -603,6 +660,10 @@ def main():
                             state_start_time = time.time()
                             consecutive_front_detections = 0  # Reset counters on abort
                             consecutive_bottom_detections = 0
+                            prev_front_cx = None
+                            prev_front_cy = None
+                            prev_bottom_cx = None
+                            prev_bottom_cy = None
             
             elif current_state == State.CENTERING:
                 # Use bottom camera to center over person
@@ -613,6 +674,8 @@ def main():
                     current_state = State.APPROACHING
                     state_start_time = time.time()
                     consecutive_bottom_detections = 0  # Reset counter on timeout
+                    prev_bottom_cx = None
+                    prev_bottom_cy = None
                 
                 elif found_bottom:
                     # Check if centered (within thresholds)
@@ -652,6 +715,8 @@ def main():
                     # Lost bottom view - reset consecutive counter and try to recover
                     if consecutive_bottom_detections > 0:
                         consecutive_bottom_detections = 0
+                        prev_bottom_cx = None
+                        prev_bottom_cy = None
                     
                     if elapsed % 1 < 0.1:  # Log every second
                         print(f"⚠️  [WARNING] Lost target in bottom camera! ({elapsed:.1f}s)")
@@ -665,6 +730,8 @@ def main():
                         current_state = State.APPROACHING
                         state_start_time = time.time()
                         consecutive_bottom_detections = 0  # Reset counter on abort
+                        prev_bottom_cx = None
+                        prev_bottom_cy = None
             
             elif current_state == State.DESCENDING:
                 # Descend to delivery altitude (20 feet / 6.1 meters)
