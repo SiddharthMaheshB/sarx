@@ -19,15 +19,17 @@ Workflow:
 Requirements: python3, picamera2, opencv-python, ultralytics, numpy, mavsdk, gpiozero
 """
 
+import sys
 import time
 import cv2
+import torch
 import numpy as np
 import asyncio
 import threading
 import math
 from datetime import datetime
+from pathlib import Path
 from picamera2 import Picamera2
-from ultralytics import YOLO
 
 try:
     from mavsdk import System
@@ -49,9 +51,22 @@ except Exception as e:
 # ============ Configuration ============
 CAM_SIZE = (640, 480)
 INFER_SIZE = 320
-MODEL_PATH = "best.pt"
+IMG_SIZE = 320
 DISPLAY_WINDOW = "Human Detection Delivery"
 FPS_AVG_ALPHA = 0.9
+
+# Model paths (try Pi paths first, then fallback)
+YOLOV5_DIR = Path("/home/drone/Desktop/yolov5")
+WEIGHTS_PT = Path("/home/drone/Desktop/final/weights_only.pt")
+MODEL_YAML = Path("/home/drone/Desktop/yolov5/models/yolov5n.yaml")
+FALLBACK_MODEL = "yolo11n.pt"
+
+# Inference settings
+CONF_THRES = 0.25
+IOU_THRES = 0.45
+USE_PYTORCH = False
+model = None
+names = ["person"]
 
 # Detection thresholds
 PERSON_CONF_THR = 0.3
@@ -88,6 +103,88 @@ class State:
     DESCENDING = "DESCENDING"
     DROPPING = "DROPPING"
     RETURNING = "RETURNING"
+
+
+# ============ Model Loading (from sarx_camera_test.py) ============
+def load_model():
+    """
+    Load YOLOv5 model using PyTorch (optimized for CPU).
+    Falls back to Ultralytics if PyTorch model not available.
+    """
+    global model, USE_PYTORCH, names
+    
+    # Try PyTorch direct loading first (optimized for Pi)
+    if YOLOV5_DIR.exists() and WEIGHTS_PT.exists() and MODEL_YAML.exists():
+        try:
+            sys.path.insert(0, str(YOLOV5_DIR))
+            from models.yolo import Model
+            from utils.general import check_yaml
+            from utils.torch_utils import select_device
+            
+            print("[MODEL] Loading YOLOv5 PyTorch model (optimized)...")
+            device = select_device("cpu")
+            cfg = check_yaml(str(MODEL_YAML))
+            model = Model(cfg, ch=3, nc=1)
+            state_dict = torch.load(str(WEIGHTS_PT), map_location="cpu")
+            model.load_state_dict(state_dict, strict=True)
+            model.to(device).eval()
+            USE_PYTORCH = True
+            names = ["person"]
+            print("[MODEL] ✓ YOLOv5 PyTorch model loaded (CPU optimized)")
+            return True
+        except Exception as e:
+            print(f"[MODEL] PyTorch loading failed: {e}")
+            print("[MODEL] Falling back to Ultralytics YOLO...")
+    
+    # Fallback to Ultralytics
+    try:
+        print("couldnt load")
+    #     from ultralytics import YOLO
+    #     print(f"[MODEL] Loading Ultralytics YOLO: {FALLBACK_MODEL}")
+    #     model = YOLO(FALLBACK_MODEL)
+    #     USE_PYTORCH = False
+    #     names = model.names
+    #     print("[MODEL] ✓ Ultralytics YOLO loaded")
+    #     return True
+    # except Exception as e:
+    #     print(f"[ERROR] Failed to load any model: {e}")
+    #     return False
+
+
+def infer_pytorch(frame, model):
+    """
+    Run PyTorch YOLOv5 inference (optimized preprocessing).
+    Returns detections tensor [N, 6] with format (x1, y1, x2, y2, conf, cls).
+    """
+    orig_h, orig_w = frame.shape[:2]
+    
+    # Resize and preprocess
+    img = cv2.resize(frame, (IMG_SIZE, IMG_SIZE))
+    img = img.transpose(2, 0, 1)  # HWC -> CHW
+    img = torch.from_numpy(img).to(torch.device("cpu"))
+    img = img.float() / 255.0
+    img = img.unsqueeze(0)
+    
+    # Inference
+    with torch.no_grad():
+        pred = model(img)
+    
+    # Post-process
+    from utils.general import non_max_suppression, scale_boxes
+    pred = non_max_suppression(pred, conf_thres=CONF_THRES, iou_thres=IOU_THRES)
+    
+    # Scale back to original frame dimensions
+    det = pred[0] if len(pred) > 0 else torch.tensor([], device="cpu")
+    if len(det) > 0:
+        det[:, :4] = scale_boxes(img.shape[2:], det[:, :4], (orig_h, orig_w)).round()
+    
+    return det
+
+
+# def infer_ultralytics(frame, model):
+#     """Run Ultralytics YOLO inference and return results."""
+#     results = model(frame, imgsz=IMG_SIZE, verbose=False)
+#     return results
 
 
 # ============ DroneController Class ============
@@ -178,11 +275,16 @@ class DroneController:
     async def _position_monitor(self):
         """Continuously monitor drone position and altitude"""
         await asyncio.sleep(5)  # Wait for connection
+        
+        await self.drone.telemetry.set_rate_position(5)
+        await self.drone.telemetry.set_rate_gps_info(1)
+        
         try:
             async for position in self.drone.telemetry.position():
                 self.current_position = position
                 self.current_altitude = -position.relative_altitude_m  # NED (negative down)
                 self.altitude_m = abs(position.relative_altitude_m)  # Positive altitude (positive = up)
+                print("[POSITION] Lat: ", position.latitude_deg, " Long: ", position.longitude_deg, " Alt: ", position.absolute_altitude_m)
                 await asyncio.sleep(0.1)
         except Exception as e:
             print(f"[DRONE] Position monitor error: {e}")
@@ -490,95 +592,143 @@ def print_state_change(old_state, new_state):
     print("="*60 + "\n")
 
 
-def draw_results(img, result, model):
-    """Draw detection boxes on image"""
-    try:
-        boxes = result.boxes.xyxy.cpu().numpy()
-        confs = result.boxes.conf.cpu().numpy()
-        clsids = result.boxes.cls.cpu().numpy().astype(int)
-    except Exception:
-        boxes = np.array(result.boxes.xyxy).astype(np.float32)
-        confs = np.array(result.boxes.conf).astype(np.float32)
-        clsids = np.array(result.boxes.cls).astype(np.int32)
+def draw_results(img, result, model, use_pytorch=False):
+    """Draw detection boxes on image (supports both PyTorch and Ultralytics)"""
+    h, w = img.shape[:2]
     
-    for (x1, y1, x2, y2), c, cid in zip(boxes, confs, clsids):
-        try:
-            label_name = model.names[int(cid)]
-        except Exception:
-            label_name = str(int(cid))
+    if use_pytorch:
+        # PyTorch format: tensor [N, 6] (x1, y1, x2, y2, conf, cls)
+        if result is not None and isinstance(result, torch.Tensor) and len(result) > 0:
+            try:
+                for *xyxy, conf, cls in result:
+                    x1, y1, x2, y2 = map(float, xyxy)
+                    x1_clamped = max(0, min(int(x1), w - 1))
+                    y1_clamped = max(0, min(int(y1), h - 1))
+                    x2_clamped = max(0, min(int(x2), w - 1))
+                    y2_clamped = max(0, min(int(y2), h - 1))
+                    
+                    if x2_clamped > x1_clamped and y2_clamped > y1_clamped:
+                        label = f"{names[int(cls)]} {conf:.2f}"
+                        color = (0, 255, 0) if names[int(cls)].lower() == "person" else (255, 0, 0)
+                        cv2.rectangle(img, (x1_clamped, y1_clamped), (x2_clamped, y2_clamped), color, 2)
+                        cv2.putText(img, label, (x1_clamped, max(10, y1_clamped-6)), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            except Exception as e:
+                print(f"[WARNING] Error drawing PyTorch results: {e}")
+    else:
+        # Ultralytics format
+        print("something wrong here")
+        # try:
+        #     boxes = result.boxes.xyxy.cpu().numpy()
+        #     confs = result.boxes.conf.cpu().numpy()
+        #     clsids = result.boxes.cls.cpu().numpy().astype(int)
+        # except Exception:
+        #     boxes = np.array(result.boxes.xyxy).astype(np.float32)
+        #     confs = np.array(result.boxes.conf).astype(np.float32)
+        #     clsids = np.array(result.boxes.cls).astype(np.int32)
         
-        label = f"{label_name} {c:.2f}"
-        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-        
-        # Highlight person detections
-        color = (0, 255, 0) if label_name.lower() == "person" else (255, 0, 0)
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(img, label, (x1, max(10, y1-6)), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        # for (x1, y1, x2, y2), c, cid in zip(boxes, confs, clsids):
+        #     try:
+        #         label_name = model.names[int(cid)]
+        #     except Exception:
+        #         label_name = str(int(cid))
+            
+        #     label = f"{label_name} {c:.2f}"
+        #     x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            
+        #     color = (0, 255, 0) if label_name.lower() == "person" else (255, 0, 0)
+        #     cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+        #     cv2.putText(img, label, (x1, max(10, y1-6)), 
+        #                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
 
-def get_person_info(result, model, orig_w, orig_h, conf_thresh=PERSON_CONF_THR):
+
+def get_person_info(result, model, orig_w, orig_h, conf_thresh=PERSON_CONF_THR, use_pytorch=False):
     """
     Get largest person detection info: area ratio and center offset from image center
     Returns: (area_ratio, center_x_offset, center_y_offset, found)
     """
-    try:
-        boxes = result.boxes.xyxy.cpu().numpy()
-        confs = result.boxes.conf.cpu().numpy()
-        clsids = result.boxes.cls.cpu().numpy().astype(int)
-    except Exception:
-        boxes = np.array(result.boxes.xyxy).astype(np.float32)
-        confs = np.array(result.boxes.conf).astype(np.float32)
-        clsids = np.array(result.boxes.cls).astype(np.int32)
-    
-    if boxes.size == 0:
-        return 0.0, 0.0, 0.0, False
-    
-    sx = orig_w / float(INFER_SIZE)
-    sy = orig_h / float(INFER_SIZE)
-    
-    max_area = 0.0
-    max_center_x = 0.0
-    max_center_y = 0.0
-    found = False
-    
-    for (x1, y1, x2, y2), conf, cid in zip(boxes, confs, clsids):
-        # Check if person
-        is_person = False
-        try:
-            name = model.names[int(cid)].lower()
-            if name == "person":
-                is_person = True
-        except Exception:
-            if int(cid) == 0:  # COCO person class
-                is_person = True
+    if use_pytorch:
+        # PyTorch format: tensor [N, 6] (x1, y1, x2, y2, conf, cls)
+        if result is None or not isinstance(result, torch.Tensor) or len(result) == 0:
+            return 0.0, 0.0, 0.0, False
         
-        if not is_person or conf < conf_thresh:
-            continue
+        max_area = 0.0
+        max_center_x = 0.0
+        max_center_y = 0.0
+        found = False
         
-        # Scale to original image size
-        x1o = max(0.0, x1 * sx)
-        y1o = max(0.0, y1 * sy)
-        x2o = min(orig_w, x2 * sx)
-        y2o = min(orig_h, y2 * sy)
+        for *xyxy, conf, cls in result:
+            x1, y1, x2, y2 = map(float, xyxy)
+            
+            # Check if person
+            if int(cls) == 0 and conf >= conf_thresh:  # Class 0 is person
+                w = max(0.0, x2 - x1)
+                h = max(0.0, y2 - y1)
+                area = w * h
+                
+                if area > max_area:
+                    max_area = area
+                    center_x = (x1 + x2) / 2.0
+                    center_y = (y1 + y2) / 2.0
+                    max_center_x = (center_x - orig_w / 2.0) / (orig_w / 2.0)
+                    max_center_y = (center_y - orig_h / 2.0) / (orig_h / 2.0)
+                    found = True
         
-        w = max(0.0, x2o - x1o)
-        h = max(0.0, y2o - y1o)
-        area = w * h
-        
-        if area > max_area:
-            max_area = area
-            # Calculate center of bounding box
-            center_x = (x1o + x2o) / 2.0
-            center_y = (y1o + y2o) / 2.0
-            # Offset from image center (normalized -1 to 1)
-            max_center_x = (center_x - orig_w / 2.0) / (orig_w / 2.0)
-            max_center_y = (center_y - orig_h / 2.0) / (orig_h / 2.0)
-            found = True
+        area_ratio = max_area / (orig_w * orig_h) if orig_w * orig_h > 0 else 0.0
+        return area_ratio, max_center_x, max_center_y, found
     
-    area_ratio = max_area / (orig_w * orig_h) if orig_w * orig_h > 0 else 0.0
-    
-    return area_ratio, max_center_x, max_center_y, found
+    else:
+        # Ultralytics format
+        if result is None:
+            return 0.0, 0.0, 0.0, False
+        print("something wrong here")
+        # try:
+        #     boxes = result.boxes.xyxy.cpu().numpy()
+        #     confs = result.boxes.conf.cpu().numpy()
+        #     clsids = result.boxes.cls.cpu().numpy().astype(int)
+        # except Exception:
+        #     boxes = np.array(result.boxes.xyxy).astype(np.float32)
+        #     confs = np.array(result.boxes.conf).astype(np.float32)
+        #     clsids = np.array(result.boxes.cls).astype(np.int32)
+        
+        # if boxes.size == 0:
+        #     return 0.0, 0.0, 0.0, False
+        
+        # max_area = 0.0
+        # max_center_x = 0.0
+        # max_center_y = 0.0
+        # found = False
+        
+        # for (x1, y1, x2, y2), conf, cid in zip(boxes, confs, clsids):
+        #     # Check if person
+        #     is_person = False
+        #     try:
+        #         name = model.names[int(cid)].lower()
+        #         if name == "person":
+        #             is_person = True
+        #     except Exception:
+        #         if int(cid) == 0:  # COCO person class
+        #             is_person = True
+            
+        #     if not is_person or conf < conf_thresh:
+        #         continue
+            
+        #     w = max(0.0, x2 - x1)
+        #     h = max(0.0, y2 - y1)
+        #     area = w * h
+            
+        #     if area > max_area:
+        #         max_area = area
+        #         center_x = (x1 + x2) / 2.0
+        #         center_y = (y1 + y2) / 2.0
+        #         max_center_x = (center_x - orig_w / 2.0) / (orig_w / 2.0)
+        #         max_center_y = (center_y - orig_h / 2.0) / (orig_h / 2.0)
+        #         found = True
+        
+        # area_ratio = max_area / (orig_w * orig_h) if orig_w * orig_h > 0 else 0.0
+        # return area_ratio, max_center_x, max_center_y, found
+
 
 
 # ============ Main Program ============
@@ -601,10 +751,10 @@ def main():
     time.sleep(1)
     print("[CAMERA] Cameras ready")
     
-    # Load YOLO model
-    print(f"[YOLO] Loading model: {MODEL_PATH}")
-    model = YOLO(MODEL_PATH)
-    print("[YOLO] Model loaded")
+    # Load YOLO model (PyTorch optimized or Ultralytics fallback)
+    if not load_model():
+        print("[ERROR] Failed to load model, exiting")
+        return
     
     # Initialize servo
     servo = init_servo()
@@ -621,10 +771,11 @@ def main():
     state_start_time = time.time()
     
     print("\n" + "="*60)
-    print("🚀 STARTING DETECTION LOOP")
+    print("STARTING DETECTION LOOP")
     print("="*60)
     print(f"Initial State: {current_state}")
-    print(f"Drone Ready: {drone.is_ready()}\n")
+    print(f"Drone Ready: {drone.is_ready()}")
+    print(f"Model: {'PyTorch (CPU optimized)' if USE_PYTORCH else 'Ultralytics'}\n")
     
     try:
         while True:
@@ -638,28 +789,29 @@ def main():
             vis0 = frame0.copy()
             vis1 = frame1.copy()
             
-            # Resize for inference
-            f0_in = cv2.resize(frame0, (INFER_SIZE, INFER_SIZE))
-            f1_in = cv2.resize(frame1, (INFER_SIZE, INFER_SIZE))
-            
-            # Run YOLO inference on both cameras
-            results = model([f0_in, f1_in], imgsz=INFER_SIZE, verbose=False)
+            # Run inference on both cameras (PyTorch or Ultralytics)
+            if USE_PYTORCH:
+                det0 = infer_pytorch(frame0, model)
+                det1 = infer_pytorch(frame1, model)
+                results = [det0, det1]
+            else:
+                results = model([frame0, frame1], imgsz=IMG_SIZE, verbose=False)
             
             # Draw results
-            if len(results) >= 1:
-                draw_results(vis0, results[0], model)
-            if len(results) >= 2:
-                draw_results(vis1, results[1], model)
+            if len(results) >= 1 and results[0] is not None:
+                draw_results(vis0, results[0], model, use_pytorch=USE_PYTORCH)
+            if len(results) >= 2 and results[1] is not None:
+                draw_results(vis1, results[1], model, use_pytorch=USE_PYTORCH)
             
             # Get detection info
             h0, w0 = frame0.shape[:2]
             h1, w1 = frame1.shape[:2]
             
             area_bottom, cx_bottom, cy_bottom, found_bottom = get_person_info(
-                results[0] if len(results) >= 1 else None, model, w0, h0
+                results[0] if len(results) >= 1 else None, model, w0, h0, use_pytorch=USE_PYTORCH
             )
             area_front, cx_front, cy_front, found_front = get_person_info(
-                results[1] if len(results) >= 2 else None, model, w1, h1
+                results[1] if len(results) >= 2 else None, model, w1, h1, use_pytorch=USE_PYTORCH
             )
             
             # ========== State Machine Logic ==========
