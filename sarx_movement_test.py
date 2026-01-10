@@ -178,6 +178,10 @@ class DroneController:
     async def _position_monitor(self):
         """Continuously monitor drone position and altitude"""
         await asyncio.sleep(5)  # Wait for connection
+
+        await self.drone.telemetry.set_rate_position(5)
+        await self.drone.telemetry.set_rate_gps_info(1)
+        # await drone.telemetry.set_rate_altitude(10)
         try:
             async for position in self.drone.telemetry.position():
                 self.current_position = position
@@ -348,7 +352,7 @@ class DroneController:
                                        self.checkpoint_position['alt'])
                     
                     # Check if arrived (within 2 meters horizontally and 1 meter vertically)
-                    if distance < 2.0 and altitude_diff < 1.0:
+                    if distance < 1.0 and altitude_diff < 1.0:
                         arrived = True
                         print(f"[DRONE] ✅ Arrived at checkpoint!")
                         print(f"   Distance: {distance:.2f}m, Alt diff: {altitude_diff:.2f}m")
@@ -605,7 +609,7 @@ def main():
         print("📍 Step 1: Adjusting to 10m altitude...")
         current_alt = drone.get_altitude()
         print(f"   Current altitude: {current_alt:.2f}m")
-        target_alt = 10.0
+        target_alt = 5.0
         alt_diff = current_alt - target_alt
         
         if abs(alt_diff) > 0.5:  # Only adjust if difference is significant
