@@ -30,6 +30,7 @@ import math
 from datetime import datetime
 from pathlib import Path
 from picamera2 import Picamera2
+from pymavlink import mavutil
 
 try:
     from mavsdk import System
@@ -41,12 +42,8 @@ except Exception as e:
     MAVSDK_AVAILABLE = False
     exit(1)
 
-try:
-    from gpiozero import Servo
-    SERVO_AVAILABLE = True
-except Exception as e:
-    print(f"[WARN] gpiozero import failed: {e}")
-    SERVO_AVAILABLE = False
+# Servo control via pymavlink - no separate import check needed
+SERVO_AVAILABLE = True
 
 # ============ Configuration ============
 CAM_SIZE = (640, 480)
@@ -88,11 +85,12 @@ DEFAULT_SEPARATION_M = 15.0  # meters between survey lines
 WAYPOINT_RADIUS = 2.0  # meters - GPS accuracy radius
 WAYPOINT_SPACING = 5.0  # meters between waypoints
 
-# Servo/drop settings
-SERVO_PIN = 18
-SERVO_INIT_MAX = True
+# Servo/drop settings (pymavlink)
+SERVO_NUMBERS = [9, 10, 11, 12, 13]  # 5 servos on Pixhawk
+SERVO_CLOSE_PWM = 900
+SERVO_OPEN_PWM = 1400
 DROP_HOLD_SECONDS = 1.0
-RESET_SERVO_AFTER_DROP = True
+current_servo_index = 0  # Tracks which servo to use next (0-4)
 
 # State timing and failsafes
 APPROACHING_TIMEOUT = 20.0  # Max 20 seconds in APPROACHING
@@ -100,6 +98,7 @@ CENTERING_TIMEOUT = 15.0  # Max 15 seconds in CENTERING
 CENTERING_LOST_TIMEOUT = 7.5  # Timeout to recover if bottom cam lost
 DESCENT_RATE = 1.0  # m/s descent speed
 RETURN_RATE = 1.0  # m/s return speed
+DETECTION_COOLDOWN = 10.0  # Seconds to ignore detections after returning from delivery
 
 
 # ============ State Machine States ============
@@ -876,41 +875,74 @@ class DroneController:
 
 # ============ Servo Control ============
 def init_servo():
-    """Initialize servo"""
-    if not SERVO_AVAILABLE:
-        print("[SERVO] gpiozero not available")
-        return None
+    """Initialize servo connection via pymavlink"""
+    global current_servo_index
     
     try:
-        servo = Servo(SERVO_PIN)
-        print(f"[SERVO] Initialized on pin {SERVO_PIN}")
-        if SERVO_INIT_MAX:
-            servo.max()
-            print("[SERVO] Set to max() (closed position)")
-        return servo
+        master = mavutil.mavlink_connection('/dev/ttyACM0', baud=115200)
+        master.wait_heartbeat()
+        print("[SERVO] Connected to Pixhawk for servo control")
+        
+        # Initialize all servos to closed position
+        for servo_num in SERVO_NUMBERS:
+            master.mav.command_long_send(
+                master.target_system,
+                master.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+                0,
+                servo_num,
+                SERVO_CLOSE_PWM,
+                0, 0, 0, 0, 0
+            )
+            time.sleep(0.1)
+        
+        print(f"[SERVO] Initialized {len(SERVO_NUMBERS)} servos (closed)")
+        current_servo_index = 0  # Reset counter
+        return master
     except Exception as e:
         print(f"[SERVO] Initialization failed: {e}")
         return None
 
 
-def drop_payload(servo):
-    """Drop payload using servo"""
-    if servo is None:
+def drop_payload(master):
+    """Drop payload using servo with counter tracking"""
+    global current_servo_index
+    
+    if master is None:
         print("[PAYLOAD] ⚠️  Drop called but servo not available")
         return False
     
+    if current_servo_index >= len(SERVO_NUMBERS):
+        print("[PAYLOAD] ⚠️  All servos have been used (5/5)")
+        return False
+    
     try:
+        servo_num = SERVO_NUMBERS[current_servo_index]
         print("\n" + "="*60)
-        print("📦 [PAYLOAD] Releasing package...")
-        servo.min()  # Open servo to drop
-        time.sleep(DROP_HOLD_SECONDS)
+        print(f"📦 [PAYLOAD] Releasing package from servo {servo_num} ({current_servo_index + 1}/5)...")
         
-        if RESET_SERVO_AFTER_DROP:
-            servo.max()  # Close servo
-            print("✅ [PAYLOAD] Package dropped successfully, servo reset")
-        else:
-            print("✅ [PAYLOAD] Package dropped")
+        # Open servo to drop payload
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+            0,
+            servo_num,
+            SERVO_OPEN_PWM,  # Open position (1400)
+            0, 0, 0, 0, 0
+        )
+        
+        time.sleep(DROP_HOLD_SECONDS)
+        print(f"✅ [PAYLOAD] Servo {servo_num} opened and remains open")
         print("="*60)
+        
+        # Increment counter for next human
+        current_servo_index += 1
+        if current_servo_index < len(SERVO_NUMBERS):
+            print(f"[SERVO] Next drop will use servo {SERVO_NUMBERS[current_servo_index]}")
+        else:
+            print("[SERVO] All servos used - no more drops available")
+        
         return True
     except Exception as e:
         print(f"❌ [PAYLOAD] Drop error: {e}")
@@ -1117,6 +1149,7 @@ def main():
     # State machine
     current_state = State.SEARCHING
     current_waypoint_idx = 0
+    last_return_time = 0  # Track when we last returned from delivery
     fps = 0.0
     last_time = time.time()
     state_start_time = time.time()
@@ -1179,13 +1212,21 @@ def main():
                 # Navigate through survey waypoints while looking for humans
                 
                 # Check if human detected - interrupt waypoint navigation
+                # Apply cooldown period after returning from delivery to avoid re-detecting same person
+                time_since_return = time.time() - last_return_time
+                
                 if found_front and area_front > PERSON_AREA_THRESHOLD_FRONT:
-                    print(f"\n🎯 [DETECTION] Human detected in FRONT camera!")
-                    print(f"   Area ratio: {area_front:.3f} (threshold: {PERSON_AREA_THRESHOLD_FRONT})")
-                    print(f"   Position offset: ({cx_front:.2f}, {cy_front:.2f})")
-                    if drone.save_checkpoint():
-                        current_state = State.APPROACHING
-                        state_start_time = time.time()
+                    if time_since_return > DETECTION_COOLDOWN:
+                        print(f"\n🎯 [DETECTION] Human detected in FRONT camera!")
+                        print(f"   Area ratio: {area_front:.3f} (threshold: {PERSON_AREA_THRESHOLD_FRONT})")
+                        print(f"   Position offset: ({cx_front:.2f}, {cy_front:.2f})")
+                        if drone.save_checkpoint():
+                            current_state = State.APPROACHING
+                            state_start_time = time.time()
+                    else:
+                        # Still in cooldown period - ignore detection
+                        if elapsed % 5 < 0.1:  # Log occasionally
+                            print(f"[COOLDOWN] Detection ignored - {DETECTION_COOLDOWN - time_since_return:.1f}s remaining")
                 
                 # Navigate to next waypoint if survey path available
                 elif survey_waypoints and len(survey_waypoints) > 0:
