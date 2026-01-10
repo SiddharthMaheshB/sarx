@@ -100,6 +100,7 @@ CENTERING_TIMEOUT = 15.0  # Max 15 seconds in CENTERING
 CENTERING_LOST_TIMEOUT = 7.5  # Timeout to recover if bottom cam lost
 DESCENT_RATE = 1.0  # m/s descent speed
 RETURN_RATE = 1.0  # m/s return speed
+DETECTION_COOLDOWN = 10.0  # Seconds to ignore detections after returning from delivery
 
 
 # ============ State Machine States ============
@@ -1117,6 +1118,7 @@ def main():
     # State machine
     current_state = State.SEARCHING
     current_waypoint_idx = 0
+    last_return_time = 0  # Track when we last returned from delivery
     fps = 0.0
     last_time = time.time()
     state_start_time = time.time()
@@ -1179,13 +1181,21 @@ def main():
                 # Navigate through survey waypoints while looking for humans
                 
                 # Check if human detected - interrupt waypoint navigation
+                # Apply cooldown period after returning from delivery to avoid re-detecting same person
+                time_since_return = time.time() - last_return_time
+                
                 if found_front and area_front > PERSON_AREA_THRESHOLD_FRONT:
-                    print(f"\n🎯 [DETECTION] Human detected in FRONT camera!")
-                    print(f"   Area ratio: {area_front:.3f} (threshold: {PERSON_AREA_THRESHOLD_FRONT})")
-                    print(f"   Position offset: ({cx_front:.2f}, {cy_front:.2f})")
-                    if drone.save_checkpoint():
-                        current_state = State.APPROACHING
-                        state_start_time = time.time()
+                    if time_since_return > DETECTION_COOLDOWN:
+                        print(f"\n🎯 [DETECTION] Human detected in FRONT camera!")
+                        print(f"   Area ratio: {area_front:.3f} (threshold: {PERSON_AREA_THRESHOLD_FRONT})")
+                        print(f"   Position offset: ({cx_front:.2f}, {cy_front:.2f})")
+                        if drone.save_checkpoint():
+                            current_state = State.APPROACHING
+                            state_start_time = time.time()
+                    else:
+                        # Still in cooldown period - ignore detection
+                        if elapsed % 5 < 0.1:  # Log occasionally
+                            print(f"[COOLDOWN] Detection ignored - {DETECTION_COOLDOWN - time_since_return:.1f}s remaining")
                 
                 # Navigate to next waypoint if survey path available
                 elif survey_waypoints and len(survey_waypoints) > 0:
