@@ -296,7 +296,23 @@ def find_best_angle_for_region(region_poly, separation_m, takeoff_point, angle_s
     For a given polygon region (full polygon or one half),
     and fixed separation, find angle (0..360) minimizing:
         survey_len + |TO-start| + |end-TO|
+    
+    Returns: (best_angle, best_path, best_survey_len, best_transit_len, best_total_len)
+    If polygon is too small, returns (None, None, None, None, None)
     """
+    # Validate that polygon is suitable for survey
+    if region_poly.is_empty:
+        return None, None, None, None, None
+    
+    minx, miny, maxx, maxy = region_poly.bounds
+    width = maxx - minx
+    height = maxy - miny
+    
+    # Check if separation is feasible (polygon must be large enough)
+    min_dim = min(width, height)
+    if separation_m > min_dim:
+        return None, None, None, None, None
+    
     tx, ty = takeoff_point
 
     best_angle = None

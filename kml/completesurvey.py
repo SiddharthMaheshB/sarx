@@ -8,7 +8,7 @@ from shapely.ops import split
 from shapely import affinity
 import custom_survey as cs
 
-PLAN_FILE = "generated_polygons/new.plan"   # change if needed
+PLAN_FILE = "mission.plan"   # change if needed
 
 FEET_PER_METER = 3.280839895  # approx conversion
 
@@ -166,10 +166,23 @@ def plot_all(poly_m,
 # ---------------- 7. Main ----------------
 
 def main():
-    poly_m, (lat0, lon0, m_per_deg_lat, m_per_deg_lon) = cs.load_polygon_from_plan_in_meters(PLAN_FILE)
+    # Load and validate polygon from mission.plan
+    try:
+        poly_m, (lat0, lon0, m_per_deg_lat, m_per_deg_lon) = cs.load_polygon_from_plan_in_meters(PLAN_FILE)
+    except FileNotFoundError:
+        print(f"ERROR: Could not find {PLAN_FILE}")
+        return
+    except Exception as e:
+        print(f"ERROR loading polygon: {e}")
+        return
+
+    if poly_m.is_empty:
+        print("ERROR: Polygon is empty")
+        return
 
     minx, miny, maxx, maxy = poly_m.bounds
     diag_m = math.hypot(maxx - minx, maxy - miny)
+    min_dim = min(maxx - minx, maxy - miny)
 
     # Takeoff / landing = midpoint of longest side
     tx, ty, longest_side_len_m = cs.longest_side_midpoint(poly_m)
@@ -180,19 +193,31 @@ def main():
     print(f"  1° latitude  ≈ {m_per_deg_lat:.3f} m")
     print(f"  1° longitude ≈ {m_per_deg_lon:.3f} m")
     print(f"Polygon diagonal ≈ {diag_m:.3f} m  ({diag_m * FEET_PER_METER:.1f} ft)")
+    print(f"Polygon min dimension ≈ {min_dim:.3f} m  ({min_dim * FEET_PER_METER:.1f} ft)")
     print(f"Longest side     ≈ {longest_side_len_m:.3f} m  ({longest_side_len_m * FEET_PER_METER:.1f} ft)")
     print(f"TO/Land (meters) = ({tx:.3f}, {ty:.3f})")
 
     # Equal-area split of the full polygon (normal angle_rad = 0 => vertical-ish cut)
-    poly1_m, poly2_m, cut_line = cs.compute_equal_area_split(poly_m, angle_rad=0.0)
-    print(f"Total area: {poly_m.area:.3f}, half areas: {poly1_m.area:.3f}, {poly2_m.area:.3f}")
+    try:
+        poly1_m, poly2_m, cut_line = cs.compute_equal_area_split(poly_m, angle_rad=0.0)
+        print(f"Total area: {poly_m.area:.3f}, half areas: {poly1_m.area:.3f}, {poly2_m.area:.3f}")
+    except Exception as e:
+        print(f"ERROR splitting polygon: {e}")
+        return
 
     # Ask user for separation in meters
+    recommended_max = min_dim * 0.8
+    print(f"\nRecommended max separation: {recommended_max:.1f} m ({recommended_max * FEET_PER_METER:.1f} ft)")
+    print(f"(Must be less than {min_dim:.1f} m)")
+    
     while True:
         try:
             separation_m = float(input("Enter separation distance x in meters: "))
             if separation_m <= 0:
                 print("Separation must be > 0")
+                continue
+            if separation_m >= min_dim:
+                print(f"Separation must be less than {min_dim:.1f} m (polygon's smallest dimension)")
                 continue
             break
         except ValueError:
@@ -214,7 +239,12 @@ def main():
     angle_half2, path2, survey_len2, transit_len2, total_len2 = cs.find_best_angle_for_region(
         poly2_m, separation_m, (tx, ty), angle_step_deg=1.0
     )
-
+    # Check if surveys were successfully generated
+    if angle_half1 is None or angle_half2 is None:
+        print("\nERROR: Could not generate survey paths for one or both halves.")
+        print(f"This may mean the separation distance {separation_m:.1f} m is too large for the polygon size.")
+        print(f"Try a smaller separation (recommended max: {min_dim * 0.8:.1f} m)")
+        return
     # print("\nFULL survey results:")
     # print(f"  Best angle: {angle_full:.2f}°")
     # print(f"  Survey length: {survey_len_full:.2f} m  ({survey_len_full * FEET_PER_METER:.2f} ft)")
