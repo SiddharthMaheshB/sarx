@@ -76,10 +76,17 @@ PERSON_AREA_THRESHOLD_BOTTOM = 0.4  # Bottom camera threshold for centered posit
 # MAV settings
 SYSTEM_ADDRESS = "serial:///dev/ttyACM0:115200"
 TAKEOFF_ALT = -15.24  # NED down negative = up 15.24m (50ft)
+SURVEY_ALT = -12.19  # NED down negative = up 12.19m (40ft) for survey
 DELIVERY_ALT = -6  # NED down negative = up 6m (20ft)
 SEARCH_SPEED = 1.0  # m/s
 APPROACH_SPEED = 0.8  # m/s
 YAW_RATE = 30.0  # deg/s
+
+# Survey path settings
+PLAN_FILE = "/home/drone/Desktop/kml/mission.plan"
+DEFAULT_SEPARATION_M = 15.0  # meters between survey lines
+WAYPOINT_RADIUS = 2.0  # meters - GPS accuracy radius
+WAYPOINT_SPACING = 5.0  # meters between waypoints
 
 # Servo/drop settings
 SERVO_PIN = 18
@@ -185,6 +192,256 @@ def infer_pytorch(frame, model):
 #     """Run Ultralytics YOLO inference and return results."""
 #     results = model(frame, imgsz=IMG_SIZE, verbose=False)
 #     return results
+
+
+# ============ Waypoint Generator ============
+
+class WaypointGenerator:
+    """Converts Shapely LineString paths to navigable GPS waypoints"""
+    
+    def __init__(self, path_m, lat0, lon0, m_per_deg_lat, m_per_deg_lon):
+        """
+        Initialize waypoint generator with path in local meters.
+        
+        Args:
+            path_m: Shapely LineString in local meters (East, North)
+            lat0, lon0: Reference GPS point for coordinate conversion
+            m_per_deg_lat, m_per_deg_lon: Meter-per-degree conversion factors
+        """
+        self.path_m = path_m
+        self.lat0 = lat0
+        self.lon0 = lon0
+        self.m_per_deg_lat = m_per_deg_lat
+        self.m_per_deg_lon = m_per_deg_lon
+        self.waypoints_gps = []
+        self.waypoints_local = []
+    
+    def generate_waypoints(self, spacing_m=5.0, altitude_m=None):
+        """
+        Generate waypoints along path at specified spacing.
+        
+        Args:
+            spacing_m: Distance between waypoints in meters
+            altitude_m: Altitude for waypoints (defaults to survey altitude)
+            
+        Returns:
+            List of (lat, lon, alt_m) tuples in GPS coordinates
+        """
+        if self.path_m is None or self.path_m.is_empty:
+            print("ERROR: No valid path to generate waypoints")
+            return []
+        
+        if altitude_m is None:
+            altitude_m = abs(SURVEY_ALT)
+        
+        total_length = self.path_m.length
+        num_points = max(2, int(total_length / spacing_m) + 1)
+        
+        print(f"  Generating {num_points} waypoints along {total_length:.1f}m path at {altitude_m:.1f}m altitude")
+        
+        for i in range(num_points):
+            # Interpolate point along path (normalized = 0.0 to 1.0)
+            fraction = i / (num_points - 1) if num_points > 1 else 0.0
+            point = self.path_m.interpolate(fraction, normalized=True)
+            
+            x_m = point.x  # East in meters
+            y_m = point.y  # North in meters
+            
+            # Convert local meters to lat/lon offset
+            dlat_deg = y_m / self.m_per_deg_lat
+            dlon_deg = x_m / self.m_per_deg_lon
+            
+            lat = self.lat0 + dlat_deg
+            lon = self.lon0 + dlon_deg
+            
+            self.waypoints_local.append((x_m, y_m))
+            self.waypoints_gps.append((lat, lon, altitude_m))
+        
+        return self.waypoints_gps
+    
+    def get_local_waypoints(self):
+        """Return waypoints in local meters (for visualization)"""
+        return self.waypoints_local
+    
+    def get_gps_waypoints(self):
+        """Return waypoints in GPS coordinates"""
+        return self.waypoints_gps
+
+
+# ============ Path Planning Functions ============
+
+def load_survey_polygon():
+    """
+    Load polygon from mission.plan file.
+    
+    Returns:
+        tuple: (poly_m, lat0, lon0, m_per_deg_lat, m_per_deg_lon) or (None, None, None, None, None) on error
+    """
+    if not SURVEY_AVAILABLE:
+        print("[SURVEY] Survey modules not available")
+        return None, None, None, None, None
+    
+    print("\n[SURVEY] Loading polygon from mission.plan...")
+    try:
+        poly_m, (lat0, lon0, m_per_deg_lat, m_per_deg_lon) = cs.load_polygon_from_plan_in_meters(
+            PLAN_FILE
+        )
+        print(f"  Polygon loaded: {poly_m.area:.1f} m²")
+        print(f"  Reference: lat0={lat0:.6f}, lon0={lon0:.6f}")
+        return poly_m, lat0, lon0, m_per_deg_lat, m_per_deg_lon
+    except Exception as e:
+        print(f"ERROR loading polygon: {e}")
+        return None, None, None, None, None
+
+
+def generate_survey_paths(poly_m, separation_m):
+    """
+    Generate survey paths for two polygon halves.
+    
+    Args:
+        poly_m: Shapely Polygon in meters
+        separation_m: Separation distance between survey lines
+        
+    Returns:
+        tuple: (path1, path2, angle_half1, angle_half2) or (None, None, None, None) on error
+    """
+    print("\n[SURVEY] Generating survey paths...")
+    try:
+        # Split polygon into two halves
+        poly1_m, poly2_m, cut_line = cs.compute_equal_area_split(poly_m, angle_rad=0.0)
+        
+        if poly1_m is None or poly2_m is None:
+            print("ERROR: Failed to split polygon into two regions")
+            print("  Polygon may be too small or irregularly shaped")
+            return None, None, None, None
+        
+        # Find best angles for each half
+        print("  Finding optimal angles for each region...")
+        angle_half1, path1, _, _, _ = cs.find_best_angle_for_region(
+            poly1_m, separation_m, (0, 0), angle_step_deg=1.0
+        )
+        angle_half2, path2, _, _, _ = cs.find_best_angle_for_region(
+            poly2_m, separation_m, (0, 0), angle_step_deg=1.0
+        )
+        
+        # Validate path generation
+        if angle_half1 is None or path1 is None:
+            print("ERROR: Could not generate survey path for first half")
+            print(f"  Separation {separation_m}m may be too large for region size")
+            minx, miny, maxx, maxy = poly_m.bounds
+            min_dim = min(maxx - minx, maxy - miny)
+            print(f"  Try reducing separation to <{min_dim/2:.1f}m")
+            return None, None, None, None
+        
+        if angle_half2 is None or path2 is None:
+            print("ERROR: Could not generate survey path for second half")
+            print(f"  Separation {separation_m}m may be too large for region size")
+            minx, miny, maxx, maxy = poly_m.bounds
+            min_dim = min(maxx - minx, maxy - miny)
+            print(f"  Try reducing separation to <{min_dim/2:.1f}m")
+            return None, None, None, None
+        
+        if path1.is_empty or path2.is_empty:
+            print("ERROR: Generated paths are empty")
+            print("  Check polygon size and separation distance")
+            return None, None, None, None
+        
+        print(f"  ✓ Half 1: angle={angle_half1:.1f} deg, path length={path1.length:.1f}m")
+        print(f"  ✓ Half 2: angle={angle_half2:.1f} deg, path length={path2.length:.1f}m")
+        
+        return path1, path2, angle_half1, angle_half2
+        
+    except Exception as e:
+        print(f"ERROR generating survey paths: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None, None, None
+
+
+def generate_waypoints_from_paths(path1, path2, lat0, lon0, m_per_deg_lat, m_per_deg_lon):
+    """
+    Generate GPS waypoints from survey paths.
+    
+    Args:
+        path1, path2: Shapely LineString paths in meters
+        lat0, lon0: Reference GPS coordinates
+        m_per_deg_lat, m_per_deg_lon: Meter-per-degree conversion factors
+        
+    Returns:
+        tuple: (waypoints1, waypoints2, all_waypoints, total_distance, est_time_min) or None on error
+    """
+    print("\n[SURVEY] Converting paths to waypoints...")
+    
+    try:
+        # Create waypoint generators for both paths
+        gen1 = WaypointGenerator(path1, lat0, lon0, m_per_deg_lat, m_per_deg_lon)
+        gen2 = WaypointGenerator(path2, lat0, lon0, m_per_deg_lat, m_per_deg_lon)
+        
+        # Use relative altitude for now - will be converted to absolute later
+        survey_altitude_relative = abs(SURVEY_ALT)  # 12.19m relative altitude
+        
+        # Generate waypoints for both paths
+        waypoints1 = gen1.generate_waypoints(spacing_m=WAYPOINT_SPACING, altitude_m=survey_altitude_relative)
+        waypoints2 = gen2.generate_waypoints(spacing_m=WAYPOINT_SPACING, altitude_m=survey_altitude_relative)
+        
+        # Validate waypoint generation
+        if not waypoints1 or not waypoints2:
+            print("ERROR: Failed to generate waypoints from paths")
+            return None
+        
+        print(f"  ✓ Path 1: {len(waypoints1)} waypoints")
+        print(f"  ✓ Path 2: {len(waypoints2)} waypoints")
+        
+        # Combine waypoints (first half, then second half)
+        all_waypoints = waypoints1 + waypoints2
+        print(f"  ✓ Total waypoints: {len(all_waypoints)}")
+        
+        # Estimate mission time
+        total_distance = path1.length + path2.length
+        est_time_min = (total_distance / SEARCH_SPEED) / 60
+        print(f"  Estimated mission time: {est_time_min:.1f} minutes")
+        print(f"  Survey altitude: {abs(SURVEY_ALT):.1f}m")
+        
+        return waypoints1, waypoints2, all_waypoints, total_distance, est_time_min
+        
+    except Exception as e:
+        print(f"ERROR generating waypoints: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def generate_survey_waypoints(separation_m=DEFAULT_SEPARATION_M):
+    """
+    Generate complete survey path waypoints (wrapper function).
+    
+    Args:
+        separation_m: Distance between survey lines
+        
+    Returns:
+        list: GPS waypoints [(lat, lon, alt), ...] or None on error
+    """
+    if not SURVEY_AVAILABLE:
+        print("[SURVEY] Survey modules not available")
+        return None
+    
+    # Load polygon
+    poly_m, lat0, lon0, m_per_deg_lat, m_per_deg_lon = load_survey_polygon()
+    if poly_m is None:
+        return None
+    
+    # Generate paths
+    path1, path2, angle_half1, angle_half2 = generate_survey_paths(poly_m, separation_m)
+    if path1 is None or path2 is None:
+        return None
+    
+    # Generate waypoints
+    result = generate_waypoints_from_paths(path1, path2, lat0, lon0, m_per_deg_lat, m_per_deg_lon)
+    if result is None:
+        return None
+    
+    waypoints1, waypoints2, all_waypoints, total_distance, est_time_min = result
+    return all_waypoints
 
 
 # ============ DroneController Class ============
@@ -353,6 +610,83 @@ class DroneController:
             self._do_yaw(yaw_rate_deg, duration),
             self.loop
         )
+    
+    def navigate_to_waypoint(self, lat, lon, alt, tolerance_m=WAYPOINT_RADIUS):
+        """Navigate to GPS waypoint and wait for arrival"""
+        if not self.loop or not self._connected:
+            print("[DRONE] Navigation requested but drone not ready")
+            return False
+        
+        fut = asyncio.run_coroutine_threadsafe(
+            self._do_navigate_waypoint(lat, lon, alt, tolerance_m),
+            self.loop
+        )
+        try:
+            return fut.result(timeout=120)
+        except Exception as e:
+            print(f"[DRONE] Navigation error: {e}")
+            return False
+    
+    async def _do_navigate_waypoint(self, lat, lon, alt, tolerance_m):
+        """Execute GPS waypoint navigation"""
+        try:
+            # Stop offboard mode to use action.goto_location
+            await self.drone.offboard.stop()
+            await asyncio.sleep(0.5)
+            
+            # Send goto command
+            await self.drone.action.goto_location(
+                latitude_deg=lat,
+                longitude_deg=lon,
+                absolute_altitude_m=alt,
+                yaw_deg=0.0
+            )
+            
+            # Monitor arrival
+            arrived = False
+            last_log_time = 0
+            
+            while not arrived:
+                if self.current_position:
+                    dist = self._calculate_gps_distance(
+                        self.current_position.latitude_deg,
+                        self.current_position.longitude_deg,
+                        lat, lon
+                    )
+                    alt_diff = abs(self.current_position.absolute_altitude_m - alt)
+                    
+                    # Check if arrived
+                    if dist < tolerance_m and alt_diff < 1.0:
+                        arrived = True
+                        break
+                    
+                    # Log progress every 5 seconds
+                    current_time = time.time()
+                    if current_time - last_log_time >= 5:
+                        print(f"   [NAV] Distance: {dist:.1f}m, Alt: {self.altitude_m:.1f}m")
+                        last_log_time = current_time
+                
+                await asyncio.sleep(0.5)
+            
+            # Resume offboard mode
+            await self.drone.offboard.set_position_ned(
+                PositionNedYaw(0.0, 0.0, TAKEOFF_ALT, 0.0)
+            )
+            await self.drone.offboard.start()
+            await asyncio.sleep(0.5)
+            
+            return arrived
+            
+        except Exception as e:
+            print(f"[DRONE] GPS navigation error: {e}")
+            try:
+                await self.drone.offboard.set_position_ned(
+                    PositionNedYaw(0.0, 0.0, TAKEOFF_ALT, 0.0)
+                )
+                await self.drone.offboard.start()
+            except:
+                pass
+            return False
     
     async def _do_yaw(self, yaw_rate, duration):
         """Execute yaw command"""
@@ -764,8 +1098,25 @@ def main():
     drone = DroneController(system_address=SYSTEM_ADDRESS)
     drone.start()
     
+    # Generate survey waypoints
+    print("\n[SURVEY] Generating survey path...")
+    survey_waypoints = generate_survey_waypoints(separation_m=DEFAULT_SEPARATION_M)
+    
+    if survey_waypoints and len(survey_waypoints) > 0:
+        print(f"[SURVEY] ✓ Survey path ready with {len(survey_waypoints)} waypoints")
+        # Wait for drone position to convert to absolute altitude
+        time.sleep(3)
+        home_alt_msl = drone.current_position.absolute_altitude_m - drone.current_position.relative_altitude_m if drone.current_position else 0
+        if home_alt_msl > 0:
+            survey_waypoints = [(lat, lon, home_alt_msl + alt) for lat, lon, alt in survey_waypoints]
+            print(f"[SURVEY] ✓ Converted to absolute altitude (Home MSL: {home_alt_msl:.1f}m)")
+    else:
+        print("[SURVEY] ⚠️  No survey path available, drone will hover in place")
+        survey_waypoints = None
+    
     # State machine
     current_state = State.SEARCHING
+    current_waypoint_idx = 0
     fps = 0.0
     last_time = time.time()
     state_start_time = time.time()
@@ -825,8 +1176,9 @@ def main():
                 break
             
             if current_state == State.SEARCHING:
-                # Looking for human in front camera
-                                
+                # Navigate through survey waypoints while looking for humans
+                
+                # Check if human detected - interrupt waypoint navigation
                 if found_front and area_front > PERSON_AREA_THRESHOLD_FRONT:
                     print(f"\n🎯 [DETECTION] Human detected in FRONT camera!")
                     print(f"   Area ratio: {area_front:.3f} (threshold: {PERSON_AREA_THRESHOLD_FRONT})")
@@ -834,8 +1186,43 @@ def main():
                     if drone.save_checkpoint():
                         current_state = State.APPROACHING
                         state_start_time = time.time()
-                elif elapsed % 5 < 0.1:  # Log every 5 seconds
-                    print(f"🔍 [SEARCHING] Scanning for target... ({elapsed:.0f}s elapsed)")
+                
+                # Navigate to next waypoint if survey path available
+                elif survey_waypoints and len(survey_waypoints) > 0:
+                    if current_waypoint_idx < len(survey_waypoints):
+                        lat, lon, alt = survey_waypoints[current_waypoint_idx]
+                        
+                        # Check if close enough to current waypoint
+                        if drone.current_position:
+                            dist = drone._calculate_gps_distance(
+                                drone.current_position.latitude_deg,
+                                drone.current_position.longitude_deg,
+                                lat, lon
+                            )
+                            
+                            if dist < WAYPOINT_RADIUS:
+                                # Reached waypoint, move to next
+                                current_waypoint_idx += 1
+                                print(f"[SURVEY] ✓ Waypoint {current_waypoint_idx}/{len(survey_waypoints)} reached")
+                                
+                                if current_waypoint_idx >= len(survey_waypoints):
+                                    print("[SURVEY] ✓ Survey complete! Restarting from beginning...")
+                                    current_waypoint_idx = 0
+                            else:
+                                # Navigate to current waypoint
+                                if elapsed % 10 < 0.1:  # Print status every 10 seconds
+                                    print(f"[SURVEY] Waypoint {current_waypoint_idx+1}/{len(survey_waypoints)} - Distance: {dist:.1f}m")
+                                
+                                # Use goto_location for waypoint navigation
+                                drone.navigate_to_waypoint(lat, lon, alt)
+                    else:
+                        # Restart survey
+                        current_waypoint_idx = 0
+                
+                else:
+                    # No survey path, just hover and search
+                    if elapsed % 5 < 0.1:
+                        print(f"🔍 [SEARCHING] Hovering and scanning for humans... ({elapsed:.0f}s)")
             
             elif current_state == State.APPROACHING:
                 # Approach the human using front camera
