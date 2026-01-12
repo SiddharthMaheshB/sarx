@@ -941,6 +941,34 @@ def drop_payload(master):
 
 
 # ============ Detection Functions ============
+def is_in_exclusion_zone(drone, exclusion_radius_m=5.0):
+    """
+    Check if current drone position is within exclusion radius of any tagged location.
+    Returns: (bool, distance) - True if in exclusion zone, and distance to nearest tagged location
+    """
+    if not drone.current_position or not tagged_locations:
+        return False, float('inf')
+    
+    current_lat = drone.current_position.latitude_deg
+    current_lon = drone.current_position.longitude_deg
+    
+    min_distance = float('inf')
+    
+    for tagged_loc in tagged_locations:
+        distance = drone._calculate_gps_distance(
+            current_lat, current_lon,
+            tagged_loc['lat'], tagged_loc['lon']
+        )
+        
+        if distance < min_distance:
+            min_distance = distance
+        
+        if distance < exclusion_radius_m:
+            return True, distance
+    
+    return False, min_distance
+
+
 def print_state_change(old_state, new_state):
     """Print state transition with visual separator"""
     print("\n" + "="*60)
@@ -1303,8 +1331,22 @@ def main():
             
             elif current_state == State.APPROACHING:
                 # Approach the human using front camera
+                # Check exclusion zone - abort if within 5m of previously tagged location
+                in_exclusion, dist_to_tagged = is_in_exclusion_zone(drone, exclusion_radius_m=5.0)
+                if in_exclusion:
+                    print(f"\n⛔ [EXCLUSION ZONE] Within {dist_to_tagged:.2f}m of previously tagged location!")
+                    print("   Aborting approach and returning to checkpoint...")
+                    if cam0_active:
+                        stop_bottom_camera(cam0)
+                        cam0_active = False
+                    # Return to checkpoint without tagging
+                    drone.return_to_checkpoint()
+                    last_return_time = time.time()
+                    current_state = State.SEARCHING
+                    state_start_time = time.time()
+                
                 # Timeout protection: return to search after 20 seconds
-                if elapsed > APPROACHING_TIMEOUT:
+                elif elapsed > APPROACHING_TIMEOUT:
                     print(f"\n [TIMEOUT] Approaching timeout after {elapsed:.1f}s!")
                     print("   Returning to search mode...")
                     if cam0_active:
@@ -1351,8 +1393,22 @@ def main():
             
             elif current_state == State.CENTERING:
                 # Use bottom camera to center over person
+                # Check exclusion zone - abort if within 5m of previously tagged location
+                in_exclusion, dist_to_tagged = is_in_exclusion_zone(drone, exclusion_radius_m=5.0)
+                if in_exclusion:
+                    print(f"\n⛔ [EXCLUSION ZONE] Within {dist_to_tagged:.2f}m of previously tagged location!")
+                    print("   Aborting centering and returning to checkpoint...")
+                    if cam0_active:
+                        stop_bottom_camera(cam0)
+                        cam0_active = False
+                    # Return to checkpoint without tagging
+                    drone.return_to_checkpoint()
+                    last_return_time = time.time()
+                    current_state = State.SEARCHING
+                    state_start_time = time.time()
+                
                 # Timeout protection: return to approach after 15 seconds
-                if elapsed > CENTERING_TIMEOUT:
+                elif elapsed > CENTERING_TIMEOUT:
                     print(f"\n⏱️  [TIMEOUT] Centering timeout after {elapsed:.1f}s!")
                     print("   Returning to APPROACHING state...")
                     if cam0_active:
