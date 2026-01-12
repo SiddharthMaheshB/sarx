@@ -46,7 +46,8 @@ except Exception as e:
 SERVO_AVAILABLE = True
 
 # ============ Configuration ============
-CAM_SIZE = (640, 480)
+CAM_NATIVE_SIZE = (3280, 2464)  # IMX219 full resolution (max FOV)
+CAM_PREVIEW_SIZE = (1280, 720)  # Use a high-res preview for best FOV and speed
 INFER_SIZE = 320
 IMG_SIZE = 320
 DISPLAY_WINDOW = "Human Detection Delivery"
@@ -1103,19 +1104,18 @@ def main():
     print("SARX")
     print("=" * 60)
     
-    # Initialize cameras
-    print("[CAMERA] Initializing cameras...")
-    cam0 = Picamera2(0)  # Bottom camera (overhead view)
-    cam1 = Picamera2(1)  # Front camera (forward view)
-    
-    cfg0 = cam0.create_preview_configuration(main={"format": "BGR888", "size": CAM_SIZE})
-    cfg1 = cam1.create_preview_configuration(main={"format": "BGR888", "size": CAM_SIZE})
+    # Initialize cameras for max FOV
+    print("[CAMERA] Initializing IMX219 cameras for max FOV...")
+    cam0 = Picamera2(0)
+    cam1 = Picamera2(1)
+    cfg0 = cam0.create_preview_configuration(main={"size": CAM_PREVIEW_SIZE, "format": "BGR888"})
+    cfg1 = cam1.create_preview_configuration(main={"size": CAM_PREVIEW_SIZE, "format": "BGR888"})
     cam0.configure(cfg0)
     cam1.configure(cfg1)
     cam0.start()
     cam1.start()
     time.sleep(1)
-    print("[CAMERA] Cameras ready")
+    print(f"[CAMERA] ✅ Cameras ready at {CAM_PREVIEW_SIZE} (IMX219 wide FOV)")
     
     # Load YOLO model (PyTorch optimized or Ultralytics fallback)
     if not load_model():
@@ -1174,18 +1174,35 @@ def main():
             vis1 = frame1.copy()
             
             # Run inference on both cameras (PyTorch or Ultralytics)
+            # Pass original full-size frames, only resize for model input, display uncropped
             if USE_PYTORCH:
                 det0 = infer_pytorch(frame0, model)
                 det1 = infer_pytorch(frame1, model)
                 results = [det0, det1]
+                draw_results(vis0, det0, model, use_pytorch=True)
+                draw_results(vis1, det1, model, use_pytorch=True)
             else:
-                results = model([frame0, frame1], imgsz=IMG_SIZE, verbose=False)
-            
-            # Draw results
-            if len(results) >= 1 and results[0] is not None:
-                draw_results(vis0, results[0], model, use_pytorch=USE_PYTORCH)
-            if len(results) >= 2 and results[1] is not None:
-                draw_results(vis1, results[1], model, use_pytorch=USE_PYTORCH)
+                h0, w0 = frame0.shape[:2]
+                h1, w1 = frame1.shape[:2]
+                f0_in = cv2.resize(frame0, (IMG_SIZE, IMG_SIZE))
+                f1_in = cv2.resize(frame1, (IMG_SIZE, IMG_SIZE))
+                results = model([f0_in, f1_in], imgsz=IMG_SIZE, verbose=False)
+                def scale_boxes_back(result, orig_w, orig_h):
+                    try:
+                        boxes = result.boxes.xyxy.cpu().numpy()
+                        scale_x = orig_w / IMG_SIZE
+                        scale_y = orig_h / IMG_SIZE
+                        boxes[:, [0, 2]] *= scale_x
+                        boxes[:, [1, 3]] *= scale_y
+                        result.boxes.xyxy = type(result.boxes.xyxy)(boxes)
+                    except Exception:
+                        pass
+                if len(results) >= 1:
+                    scale_boxes_back(results[0], w0, h0)
+                    draw_results(vis0, results[0], model, use_pytorch=False)
+                if len(results) >= 2:
+                    scale_boxes_back(results[1], w1, h1)
+                    draw_results(vis1, results[1], model, use_pytorch=False)
             
             # Get detection info
             h0, w0 = frame0.shape[:2]

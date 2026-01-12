@@ -26,7 +26,11 @@ from pathlib import Path
 from picamera2 import Picamera2
 
 # ============ Configuration ============
-CAM_SIZE = (640, 480)
+CAM_NATIVE_SIZE = (3280, 2464)  # IMX219 full resolution (max FOV)
+CAM_PREVIEW_SIZE = (1280, 720)  # Use a high-res preview for best FOV and speed
+INFER_SIZE = 320
+DISPLAY_WINDOW = "SARX Camera Test"
+FPS_AVG_ALPHA = 0.9
 INFER_SIZE = 320
 DISPLAY_WINDOW = "SARX Camera Test"
 FPS_AVG_ALPHA = 0.9
@@ -406,19 +410,19 @@ def main():
         print("[ERROR] Failed to load model. Exiting.")
         return
     
-    # Initialize cameras
-    print("[CAMERA] Initializing cameras...")
-    cam0 = Picamera2(0)  # Bottom camera (overhead view)
-    cam1 = Picamera2(1)  # Front camera (forward view)
-    
-    cfg0 = cam0.create_preview_configuration(main={"format": "BGR888", "size": CAM_SIZE})
-    cfg1 = cam1.create_preview_configuration(main={"format": "BGR888", "size": CAM_SIZE})
+    # Initialize cameras for max FOV
+    print("[CAMERA] Initializing IMX219 cameras for max FOV...")
+    cam0 = Picamera2(0)
+    cam1 = Picamera2(1)
+    # Use preview size that matches wide FOV and is fast enough for inference
+    cfg0 = cam0.create_preview_configuration(main={"size": CAM_PREVIEW_SIZE, "format": "BGR888"})
+    cfg1 = cam1.create_preview_configuration(main={"size": CAM_PREVIEW_SIZE, "format": "BGR888"})
     cam0.configure(cfg0)
     cam1.configure(cfg1)
     cam0.start()
     cam1.start()
     time.sleep(1)
-    print("[CAMERA] ✅ Cameras ready\n")
+    print(f"[CAMERA]  Cameras ready at {CAM_PREVIEW_SIZE} (IMX219 wide FOV)\n")
     
     # Initialize simulated drone controller
     drone = SimulatedDroneController()
@@ -432,7 +436,7 @@ def main():
     state_start_time = time.time()
     
     print("="*60)
-    print("🚀 STARTING DETECTION LOOP")
+    print(" STARTING DETECTION LOOP")
     print("="*60)
     print(f"Initial State: {current_state}\n")
     
@@ -448,27 +452,44 @@ def main():
             vis0 = frame0.copy()
             vis1 = frame1.copy()
             
-            # Get frame dimensions
+            # Get frame dimensions (should match preview size for max FOV)
             h0, w0 = frame0.shape[:2]
             h1, w1 = frame1.shape[:2]
+            # If you want to use the full sensor, you can use capture_image() with CAM_NATIVE_SIZE, but preview is faster for real-time
             
             # Run inference (PyTorch optimized or Ultralytics)
-            # Pass original full-size frames - let inference functions handle resizing
+            # Pass original full-size frames, only resize for model input, display uncropped
             if USE_PYTORCH:
-                result0 = infer_pytorch(frame0, model)  # Pass original frame
-                result1 = infer_pytorch(frame1, model)  # Pass original frame
-                # Draw results
+                # For PyTorch, infer_pytorch resizes internally, so just pass the full frame
+                result0 = infer_pytorch(frame0, model)
+                result1 = infer_pytorch(frame1, model)
                 draw_results(vis0, result0, use_pytorch=True)
                 draw_results(vis1, result1, use_pytorch=True)
             else:
-                # For Ultralytics, resize first since it doesn't handle it internally
+                # For Ultralytics, resize for model input but display uncropped
+                h0, w0 = frame0.shape[:2]
+                h1, w1 = frame1.shape[:2]
+                # Resize to model input size, but keep original for display
                 f0_in = cv2.resize(frame0, (INFER_SIZE, INFER_SIZE))
                 f1_in = cv2.resize(frame1, (INFER_SIZE, INFER_SIZE))
                 results = model([f0_in, f1_in], imgsz=INFER_SIZE, verbose=False)
-                # Draw results
+                # The results boxes are in the resized image coordinates, so we need to scale them back to original size for drawing
+                def scale_boxes_back(result, orig_w, orig_h):
+                    # Scale detection boxes from model input size back to original image size
+                    try:
+                        boxes = result.boxes.xyxy.cpu().numpy()
+                        scale_x = orig_w / INFER_SIZE
+                        scale_y = orig_h / INFER_SIZE
+                        boxes[:, [0, 2]] *= scale_x
+                        boxes[:, [1, 3]] *= scale_y
+                        result.boxes.xyxy = type(result.boxes.xyxy)(boxes)
+                    except Exception:
+                        pass
                 if len(results) >= 1:
+                    scale_boxes_back(results[0], w0, h0)
                     draw_results(vis0, results[0], use_pytorch=False)
                 if len(results) >= 2:
+                    scale_boxes_back(results[1], w1, h1)
                     draw_results(vis1, results[1], use_pytorch=False)
                 result0 = results[0] if len(results) >= 1 else None
                 result1 = results[1] if len(results) >= 2 else None
@@ -512,7 +533,7 @@ def main():
                     
                     # Check if human visible in bottom camera
                     if found_bottom and area_bottom > 0.05:
-                        print(f"\n👁️  [DETECTION] Human now visible in BOTTOM camera!")
+                        print(f"\n [DETECTION] Human now visible in BOTTOM camera!")
                         print(f"   Area: {area_bottom:.3f}")
                         current_state = State.CENTERING
                         state_start_time = time.time()
@@ -698,8 +719,8 @@ def main():
                 cv2.line(vis0, (center_x, center_y - 30), (center_x, center_y + 30), (0, 255, 0), 2)
                 cv2.circle(vis0, (center_x, center_y), 50, (0, 255, 0), 2)
             
-            # Combine views
-            target_h = 360
+            # Combine views for display, keep aspect ratio and wide FOV
+            target_h = 480  # Higher display height for wide FOV
             vis0_resized = cv2.resize(vis0, (int(w0 * target_h / h0), target_h))
             vis1_resized = cv2.resize(vis1, (int(w1 * target_h / h1), target_h))
             combined = np.hstack((vis0_resized, vis1_resized))
