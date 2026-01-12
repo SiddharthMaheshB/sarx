@@ -1,3 +1,5 @@
+# ============ Global List for Centered Detections ============
+
 #!/usr/bin/env python3
 """
 human_detection_delivery.py
@@ -44,7 +46,7 @@ except Exception as e:
 
 # Servo control via pymavlink - no separate import check needed
 SERVO_AVAILABLE = True
-
+centered_gps_locations = []
 # ============ Configuration ============
 CAM_NATIVE_SIZE = (3280, 2464)  # IMX219 full resolution (max FOV)
 CAM_PREVIEW_SIZE = (1280, 720)  # Use a high-res preview for best FOV and speed
@@ -1161,6 +1163,7 @@ def main():
     print(f"Drone Ready: {drone.is_ready()}")
     print(f"Model: {'PyTorch (CPU optimized)' if USE_PYTORCH else 'Ultralytics'}\n")
     
+    global centered_gps_locations
     try:
         while True:
             # Capture frames from both cameras
@@ -1240,7 +1243,7 @@ def main():
                         if drone.save_checkpoint():
                             current_state = State.APPROACHING
                             state_start_time = time.time()
-                    else:
+                    else:   
                         # Still in cooldown period - ignore detection
                         if elapsed % 5 < 0.1:  # Log occasionally
                             print(f"[COOLDOWN] Detection ignored - {DETECTION_COOLDOWN - time_since_return:.1f}s remaining")
@@ -1338,6 +1341,15 @@ def main():
                     if abs(cx_bottom) < 0.10 and abs(cy_bottom) < 0.10:
                         # Person is centered horizontally and vertically
                         if area_bottom >= PERSON_AREA_THRESHOLD_BOTTOM:
+                            # Save current GPS location to global list before descending
+                            if drone.current_position:
+                                centered_gps_locations.append({
+                                    'lat': drone.current_position.latitude_deg,
+                                    'lon': drone.current_position.longitude_deg,
+                                    'alt': drone.current_position.absolute_altitude_m,
+                                    'timestamp': time.time()
+                                })
+                                print(f"[CENTERED] GPS location saved: {centered_gps_locations[-1]}")
                             # Ready to descend and deliver
                             print(f"\n✅ [CENTERED] Person centered in bottom camera!")
                             print(f"   Area: {area_bottom:.3f} (threshold: {PERSON_AREA_THRESHOLD_BOTTOM})")
@@ -1367,6 +1379,7 @@ def main():
                             yaw_rate=0.0,
                             duration=0.3
                         )
+                    
                 else:
                     # Lost bottom view - try to recover by moving upward
                     if elapsed % 1 < 0.1:  # Log every second
