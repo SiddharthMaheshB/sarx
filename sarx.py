@@ -1,9 +1,5 @@
-# ============ Global List for Centered Detections ============
-
 #!/usr/bin/env python3
 """
-human_detection_delivery.py
-
 Advanced human detection and delivery system combining dual cameras and MAVLink control.
 
 Workflow:
@@ -33,7 +29,7 @@ from datetime import datetime
 from pathlib import Path
 from picamera2 import Picamera2
 from pymavlink import mavutil
-
+import custom_survey as cs
 try:
     from mavsdk import System
     from mavsdk.offboard import VelocityBodyYawspeed, PositionNedYaw
@@ -46,8 +42,7 @@ except Exception as e:
 
 # Servo control via pymavlink - no separate import check needed
 SERVO_AVAILABLE = True
-centered_gps_locations = []
-# ============ Configuration ============
+tagged_locations = []
 CAM_NATIVE_SIZE = (3280, 2464)  # IMX219 full resolution (max FOV)
 CAM_PREVIEW_SIZE = (1280, 720)  # Use a high-res preview for best FOV and speed
 INFER_SIZE = 320
@@ -155,9 +150,9 @@ def load_model():
     #     names = model.names
     #     print("[MODEL] ✓ Ultralytics YOLO loaded")
     #     return True
-    # except Exception as e:
-    #     print(f"[ERROR] Failed to load any model: {e}")
-    #     return False
+    except Exception as e:
+        print(f"[ERROR] Failed to load any model: {e}")
+        return False
 
 
 def infer_pytorch(frame, model):
@@ -279,10 +274,6 @@ def load_survey_polygon():
     Returns:
         tuple: (poly_m, lat0, lon0, m_per_deg_lat, m_per_deg_lon) or (None, None, None, None, None) on error
     """
-    if not SURVEY_AVAILABLE:
-        print("[SURVEY] Survey modules not available")
-        return None, None, None, None, None
-    
     print("\n[SURVEY] Loading polygon from mission.plan...")
     try:
         poly_m, (lat0, lon0, m_per_deg_lat, m_per_deg_lon) = cs.load_polygon_from_plan_in_meters(
@@ -423,10 +414,6 @@ def generate_survey_waypoints(separation_m=DEFAULT_SEPARATION_M):
     Returns:
         list: GPS waypoints [(lat, lon, alt), ...] or None on error
     """
-    if not SURVEY_AVAILABLE:
-        print("[SURVEY] Survey modules not available")
-        return None
-    
     # Load polygon
     poly_m, lat0, lon0, m_per_deg_lat, m_per_deg_lon = load_survey_polygon()
     if poly_m is None:
@@ -961,6 +948,28 @@ def print_state_change(old_state, new_state):
     print("="*60 + "\n")
 
 
+def start_bottom_camera(cam0):
+    """Start the bottom camera"""
+    try:
+        cam0.start()
+        print("[CAMERA] ✅ Bottom camera started")
+        return True
+    except Exception as e:
+        print(f"[CAMERA] ⚠️  Error starting bottom camera: {e}")
+        return False
+
+
+def stop_bottom_camera(cam0):
+    """Stop the bottom camera to save resources"""
+    try:
+        cam0.stop()
+        print("[CAMERA] Bottom camera stopped (idle)")
+        return True
+    except Exception as e:
+        print(f"[CAMERA] ⚠️  Error stopping bottom camera: {e}")
+        return False
+
+
 def draw_results(img, result, model, use_pytorch=False):
     """Draw detection boxes on image (supports both PyTorch and Ultralytics)"""
     h, w = img.shape[:2]
@@ -1108,16 +1117,18 @@ def main():
     
     # Initialize cameras for max FOV
     print("[CAMERA] Initializing IMX219 cameras for max FOV...")
-    cam0 = Picamera2(0)
-    cam1 = Picamera2(1)
+    cam0 = Picamera2(0)  # Bottom camera (started only during APPROACHING)
+    cam1 = Picamera2(1)  # Front camera (always active during search)
     cfg0 = cam0.create_preview_configuration(main={"size": CAM_PREVIEW_SIZE, "format": "BGR888"})
     cfg1 = cam1.create_preview_configuration(main={"size": CAM_PREVIEW_SIZE, "format": "BGR888"})
     cam0.configure(cfg0)
     cam1.configure(cfg1)
-    cam0.start()
+    # Start only front camera initially - bottom camera will start on APPROACHING
     cam1.start()
-    time.sleep(1)
-    print(f"[CAMERA] ✅ Cameras ready at {CAM_PREVIEW_SIZE} (IMX219 wide FOV)")
+    time.sleep(0.5)
+    cam0_active = False
+    print(f"[CAMERA]  Front camera ready at {CAM_PREVIEW_SIZE} (IMX219 wide FOV)")
+    print(f"[CAMERA] Bottom camera initialized (will start on APPROACHING)")
     
     # Load YOLO model (PyTorch optimized or Ultralytics fallback)
     if not load_model():
@@ -1145,7 +1156,7 @@ def main():
             survey_waypoints = [(lat, lon, home_alt_msl + alt) for lat, lon, alt in survey_waypoints]
             print(f"[SURVEY] ✓ Converted to absolute altitude (Home MSL: {home_alt_msl:.1f}m)")
     else:
-        print("[SURVEY] ⚠️  No survey path available, drone will hover in place")
+        print("[SURVEY]   No survey path available, drone will hover in place")
         survey_waypoints = None
     
     # State machine
@@ -1163,7 +1174,7 @@ def main():
     print(f"Drone Ready: {drone.is_ready()}")
     print(f"Model: {'PyTorch (CPU optimized)' if USE_PYTORCH else 'Ultralytics'}\n")
     
-    global centered_gps_locations
+    global tagged_locations
     try:
         while True:
             # Capture frames from both cameras
@@ -1237,10 +1248,15 @@ def main():
                 
                 if found_front and area_front > PERSON_AREA_THRESHOLD_FRONT:
                     if time_since_return > DETECTION_COOLDOWN:
-                        print(f"\n🎯 [DETECTION] Human detected in FRONT camera!")
+                        print(f"\n [DETECTION] Human detected in FRONT camera!")
                         print(f"   Area ratio: {area_front:.3f} (threshold: {PERSON_AREA_THRESHOLD_FRONT})")
                         print(f"   Position offset: ({cx_front:.2f}, {cy_front:.2f})")
                         if drone.save_checkpoint():
+                            # Start bottom camera for precise approach
+                            if not cam0_active:
+                                start_bottom_camera(cam0)
+                                cam0_active = True
+                                time.sleep(0.5)  # Give camera time to start
                             current_state = State.APPROACHING
                             state_start_time = time.time()
                     else:   
@@ -1289,14 +1305,17 @@ def main():
                 # Approach the human using front camera
                 # Timeout protection: return to search after 20 seconds
                 if elapsed > APPROACHING_TIMEOUT:
-                    print(f"\n⏱️  [TIMEOUT] Approaching timeout after {elapsed:.1f}s!")
+                    print(f"\n [TIMEOUT] Approaching timeout after {elapsed:.1f}s!")
                     print("   Returning to search mode...")
+                    if cam0_active:
+                        stop_bottom_camera(cam0)
+                        cam0_active = False
                     current_state = State.SEARCHING
                     state_start_time = time.time()
                 
                 # CHECK FOR BOTTOM CAMERA FIRST - transition to CENTERING if detected
                 elif found_bottom:
-                    print(f"\n👁️  [TRANSITION] Human detected in BOTTOM camera!")
+                    print(f"\n [TRANSITION] Human detected in BOTTOM camera!")
                     print(f"   Bottom area: {area_bottom:.3f}")
                     if found_front:
                         print(f"   Front area: {area_front:.3f}")
@@ -1311,12 +1330,12 @@ def main():
                         yaw_rate = cx_front * YAW_RATE  # Proportional yaw control
                         drone.yaw_towards(yaw_rate_deg=yaw_rate, duration=0.3)
                         if elapsed % 2 < 0.1:  # Log every 2 seconds
-                            print(f"🔄 [APPROACHING] Yawing to face person (offset: {cx_front:.2f})")
+                            print(f" [APPROACHING] Yawing to face person (offset: {cx_front:.2f})")
                     else:
                         # Facing person, now move forward
                         drone.move_forward(speed=APPROACH_SPEED, duration=0.3)
                         if elapsed % 2 < 0.1:
-                            print(f"➡️  [APPROACHING] Moving forward toward person (area: {area_front:.3f})")
+                            print(f"  [APPROACHING] Moving forward toward person (area: {area_front:.3f})")
                 else:
                     # Lost target in front camera
                     if elapsed % 1 < 0.1:  # Log every second
@@ -1324,6 +1343,9 @@ def main():
                     # Stay in approaching a bit longer before giving up
                     if elapsed > APPROACHING_TIMEOUT / 2:
                         print("\n❌ [ABORT] Lost target for too long, returning to SEARCHING")
+                        if cam0_active:
+                            stop_bottom_camera(cam0)
+                            cam0_active = False
                         current_state = State.SEARCHING
                         state_start_time = time.time()
             
@@ -1333,6 +1355,9 @@ def main():
                 if elapsed > CENTERING_TIMEOUT:
                     print(f"\n⏱️  [TIMEOUT] Centering timeout after {elapsed:.1f}s!")
                     print("   Returning to APPROACHING state...")
+                    if cam0_active:
+                        stop_bottom_camera(cam0)
+                        cam0_active = False
                     current_state = State.APPROACHING
                     state_start_time = time.time()
                 
@@ -1343,13 +1368,13 @@ def main():
                         if area_bottom >= PERSON_AREA_THRESHOLD_BOTTOM:
                             # Save current GPS location to global list before descending
                             if drone.current_position:
-                                centered_gps_locations.append({
+                                tagged_locations.append({
                                     'lat': drone.current_position.latitude_deg,
                                     'lon': drone.current_position.longitude_deg,
                                     'alt': drone.current_position.absolute_altitude_m,
                                     'timestamp': time.time()
                                 })
-                                print(f"[CENTERED] GPS location saved: {centered_gps_locations[-1]}")
+                                print(f"[CENTERED] GPS location saved: {tagged_locations[-1]}")
                             # Ready to descend and deliver
                             print(f"\n✅ [CENTERED] Person centered in bottom camera!")
                             print(f"   Area: {area_bottom:.3f} (threshold: {PERSON_AREA_THRESHOLD_BOTTOM})")
@@ -1391,6 +1416,9 @@ def main():
                     # If lost for too long, abort centering
                     if elapsed > CENTERING_TIMEOUT / 2:
                         print(f"\n❌ [ABORT] Lost target for {elapsed:.1f}s, returning to APPROACHING")
+                        if cam0_active:
+                            stop_bottom_camera(cam0)
+                            cam0_active = False
                         current_state = State.APPROACHING
                         state_start_time = time.time()
             
@@ -1446,6 +1474,11 @@ def main():
                     print(f"   Final altitude: {drone.get_altitude():.2f}m")
                     print("   Resuming search for next target...")
                     print("="*60)
+                    # Stop bottom camera to save resources during search
+                    if cam0_active:
+                        stop_bottom_camera(cam0)
+                        cam0_active = False
+                    last_return_time = time.time()  # Update cooldown timer
                     current_state = State.SEARCHING
                     state_start_time = time.time()
             
@@ -1519,8 +1552,15 @@ def main():
                 print(f"[CLEANUP] Drone stop error: {e}")
         
         # Stop cameras
-        cam0.stop()
-        cam1.stop()
+        try:
+            if cam0_active:
+                cam0.stop()
+        except Exception:
+            pass
+        try:
+            cam1.stop()
+        except Exception:
+            pass
         cv2.destroyAllWindows()
         
         print("[CLEANUP] Complete. Goodbye!")
