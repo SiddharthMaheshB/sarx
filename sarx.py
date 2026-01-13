@@ -285,7 +285,30 @@ def load_survey_polygon():
     except Exception as e:
         print(f"ERROR loading polygon: {e}")
         return None, None, None, None, None
+    
+RTL_ALTITUDE_M = 20.0  # desired RTL height (meters AGL)
 
+async def rtl_at_height(drone):
+    """
+    Commands the drone to first go to a specific altitude,
+    then initiate RTL.
+    """
+
+    print(f"[RTL] Adjusting altitude to {RTL_ALTITUDE_M}m before RTL...")
+
+    # NED frame: Down is positive, Up is negative
+    ned_down = -RTL_ALTITUDE_M
+
+    # Hold current X/Y, only change altitude
+    await drone.offboard.set_position_ned(
+        PositionNedYaw(0.0, 0.0, ned_down, 0.0)
+    )
+
+    # Wait until altitude is reached
+    await asyncio.sleep(4)
+
+    print("[RTL] Initiating Return to Launch")
+    await drone.action.return_to_launch()
 
 def generate_survey_paths(poly_m, separation_m):
     """
@@ -1325,9 +1348,11 @@ def main():
                         current_waypoint_idx = 0
                 
                 else:
-                    # No survey path, just hover and search
-                    if elapsed % 5 < 0.1:
-                        print(f"🔍 [SEARCHING] Hovering and scanning for humans... ({elapsed:.0f}s)")
+                    # No survey path, return to rtl
+                    asyncio.run_coroutine_threadsafe(
+                    rtl_at_height(drone.drone),
+                    drone.loop)
+
             
             elif current_state == State.APPROACHING:
                 # Approach the human using front camera
