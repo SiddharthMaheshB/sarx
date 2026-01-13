@@ -1455,7 +1455,10 @@ def main():
                                     'alt': drone.current_position.absolute_altitude_m,
                                     'timestamp': time.time()
                                 })
+                                text = f"GPS coords: lat={drone.current_position.latitude_deg:.6f} lon={drone.current_position.longitude_deg:.6f} alt={drone.current_position.absolute_altitude_m:.1f}"
+                                m.mav.statustext_send(mavutil.mavlink.MAV_SEVERITY_INFO, text.encode('utf-8'))
                                 print(f"[CENTERED] GPS location saved: {tagged_locations[-1]}")
+
                             # Ready to descend and deliver
                             print(f"\n✅ [CENTERED] Person centered in bottom camera!")
                             print(f"   Area: {area_bottom:.3f} (threshold: {PERSON_AREA_THRESHOLD_BOTTOM})")
