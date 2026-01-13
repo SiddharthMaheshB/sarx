@@ -1200,8 +1200,12 @@ def main():
 
     #uncomment to enable survey waypoints
 
-    survey_waypoints = generate_survey_waypoints(separation_m=DEFAULT_SEPARATION_M)
+
+    # survey_waypoints = generate_survey_waypoints(separation_m=DEFAULT_SEPARATION_M)
     
+
+    survey_waypoints = [(28.415914,77.525249),(28.416038,77.525218)]
+
 
 
     if survey_waypoints and len(survey_waypoints) > 0:
