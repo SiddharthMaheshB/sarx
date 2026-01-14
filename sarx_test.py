@@ -73,8 +73,8 @@ SYSTEM_ADDRESS = "serial:///dev/ttyACM0:115200"
 TAKEOFF_ALT = -15.24  # NED down negative = up 15.24m (50ft)
 SURVEY_ALT = -12.19  # NED down negative = up 12.19m (40ft) for survey
 DELIVERY_ALT = -6  # NED down negative = up 6m (20ft)
-SEARCH_SPEED = 1.0  # m/s
-APPROACH_SPEED = 0.8  # m/s
+SEARCH_SPEED = 0.5  # m/s
+APPROACH_SPEED = 0.2  # m/s
 YAW_RATE = 30.0  # deg/s
 
 # Survey path settings
@@ -553,7 +553,7 @@ class DroneController:
                 self.current_position = position
                 self.current_altitude = -position.relative_altitude_m  # NED (negative down)
                 self.altitude_m = abs(position.relative_altitude_m)  # Positive altitude (positive = up)
-                print("[POSITION] Lat: ", position.latitude_deg, " Long: ", position.longitude_deg, " Alt: ", position.absolute_altitude_m)
+                # print("[POSITION] Lat: ", position.latitude_deg, " Long: ", position.longitude_deg, " Alt: ", position.absolute_altitude_m)
                 await asyncio.sleep(0.1)
         except Exception as e:
             print(f"[DRONE] Position monitor error: {e}")
@@ -962,7 +962,6 @@ def drop_payload(master):
         print("="*60)
         return False
 
-def send_telemetry():
 # ============ Detection Functions ============
 def is_in_exclusion_zone(drone, exclusion_radius_m=5.0):
     """
@@ -1168,18 +1167,19 @@ def main():
     
     # Initialize cameras for max FOV
     print("[CAMERA] Initializing IMX219 cameras for max FOV...")
-    cam0 = Picamera2(0)  # Bottom camera (started only during APPROACHING)
-    cam1 = Picamera2(1)  # Front camera (always active during search)
+    cam0 = Picamera2(1)  # Bottom camera (started only during APPROACHING)
+    cam1 = Picamera2(0)  # Front camera (always active during search)
     cfg0 = cam0.create_preview_configuration(main={"size": CAM_PREVIEW_SIZE, "format": "BGR888"})
     cfg1 = cam1.create_preview_configuration(main={"size": CAM_PREVIEW_SIZE, "format": "BGR888"})
     cam0.configure(cfg0)
     cam1.configure(cfg1)
-    # Start only front camera initially - bottom camera will start on APPROACHING
+    # Start both cameras
+    cam0.start()
     cam1.start()
     time.sleep(0.5)
-    cam0_active = False
-    print(f"[CAMERA]  Front camera ready at {CAM_PREVIEW_SIZE} (IMX219 wide FOV)")
-    print(f"[CAMERA] Bottom camera initialized (will start on APPROACHING)")
+    cam0_active = True
+    print(f"[CAMERA] ✓ Bottom camera ready at {CAM_PREVIEW_SIZE} (IMX219 wide FOV)")
+    print(f"[CAMERA] ✓ Front camera ready at {CAM_PREVIEW_SIZE} (IMX219 wide FOV)")
     
     # Load YOLO model (PyTorch optimized or Ultralytics fallback)
     if not load_model():
@@ -1204,7 +1204,9 @@ def main():
     # survey_waypoints = generate_survey_waypoints(separation_m=DEFAULT_SEPARATION_M)
     
 
-    survey_waypoints = [(28.415914,77.525249),(28.416038,77.525218)]
+    # survey_waypoints = [(28.415914,77.525249),(28.416038,77.525218)]
+    # survey_waypoints = [(28.416381,77.525333,10),(28.416468,77.525224,10),(28.416381,77.525333,10)]
+    survey_waypoints = [(28.416159,77.525385,10),(28.416092,77.525227,10),(28.416159,77.525385,10)]
 
 
 
