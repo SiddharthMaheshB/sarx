@@ -1,7 +1,7 @@
 import json
 from lxml import etree
 
-KML_FILE = "generated_polygons/map.kml"
+KML_FILE = "/home/drone/Desktop/test.kml"
 OUTPUT_PLAN = "mission.plan"
 DEFAULT_ALTITUDE = 20.0
 
@@ -81,8 +81,7 @@ def build_qgc_plan(coords):
     
     polygon = []
     for i, (lat,lon,alt) in enumerate(coords):
-        if i == 0  or i == len(coords)-1:
-            continue
+
         polygon.append([
             lat,lon
         ])
