@@ -1181,6 +1181,18 @@ def main():
     print(f"[CAMERA] ✓ Bottom camera ready at {CAM_PREVIEW_SIZE} (IMX219 wide FOV)")
     print(f"[CAMERA] ✓ Front camera ready at {CAM_PREVIEW_SIZE} (IMX219 wide FOV)")
     
+    # Initialize video writers for recording
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    Path("/home/drone/Desktop/recordings").mkdir(exist_ok=True)
+    front_footage_path = f"/home/drone/Desktop/recordings/front_footage_{timestamp}.avi"
+    back_footage_path = f"/home/drone/Desktop/recordings/back_footage_{timestamp}.avi"
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    fps_record = 20.0  # Recording FPS
+    front_writer = cv2.VideoWriter(front_footage_path, fourcc, fps_record, CAM_PREVIEW_SIZE)
+    back_writer = cv2.VideoWriter(back_footage_path, fourcc, fps_record, CAM_PREVIEW_SIZE)
+    print(f"[RECORDING] Front footage: {front_footage_path}")
+    print(f"[RECORDING] Back footage: {back_footage_path}")
+    
     # Load YOLO model (PyTorch optimized or Ultralytics fallback)
     if not load_model():
         print("[ERROR] Failed to load model, exiting")
@@ -1610,6 +1622,12 @@ def main():
                 cv2.line(vis0, (center_x, center_y - 30), (center_x, center_y + 30), (0, 255, 0), 2)
                 cv2.circle(vis0, (center_x, center_y), 50, (0, 255, 0), 2)
             
+            # Record frames to video files (save visualization as displayed)
+            if back_writer.isOpened():
+                back_writer.write(vis0)
+            if front_writer.isOpened():
+                front_writer.write(vis1)
+            
             # Combine views
             target_h = 360
             vis0_resized = cv2.resize(vis0, (int(w0 * target_h / h0), target_h))
@@ -1647,6 +1665,20 @@ def main():
                 drone.stop_and_land()
             except Exception as e:
                 print(f"[CLEANUP] Drone stop error: {e}")
+        
+        # Release video writers
+        try:
+            if front_writer.isOpened():
+                front_writer.release()
+                print(f"[RECORDING] ✓ Front footage saved: {front_footage_path}")
+        except Exception as e:
+            print(f"[CLEANUP] Front writer error: {e}")
+        try:
+            if back_writer.isOpened():
+                back_writer.release()
+                print(f"[RECORDING] ✓ Back footage saved: {back_footage_path}")
+        except Exception as e:
+            print(f"[CLEANUP] Back writer error: {e}")
         
         # Stop cameras
         try:
