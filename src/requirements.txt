@@ -1,0 +1,22 @@
+# SARX Dependencies
+
+# Core Python packages
+numpy>=1.21.0
+opencv-python>=4.5.0
+
+# Deep Learning
+torch>=1.10.0
+torchvision>=0.11.0
+
+# Raspberry Pi Camera (only needed on Pi)
+picamera2>=0.3.0
+
+# Drone Control
+mavsdk>=1.4.0
+pymavlink>=2.4.0
+
+# Geometry for path planning
+shapely>=1.8.0
+
+# Optional: Ultralytics YOLO (fallback)
+# ultralytics>=8.0.0
